@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>孙权 · 从一小步开始</title>
+  <link rel="icon" type="image/x-icon" href="/favicon.ico?v=sunquan-1">
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">跳到主要内容</a>
+  <div class="shell">
+    <aside class="sidebar" aria-label="应用导航">
+      <a class="brand" href="#today" aria-label="孙权，回到今日"><img class="brand-mark" src="/sunquan-icon.png" width="48" height="48" alt=""><span>孙权<small>每次，向前一点。</small></span></a>
+      <nav class="nav" aria-label="主要页面">
+        <button type="button" data-view="today" aria-current="page"><span aria-hidden="true">◷</span>今日</button>
+        <button type="button" data-view="learn"><span aria-hidden="true">↗</span>学习</button>
+        <button type="button" data-view="memory"><span aria-hidden="true">≋</span>记忆</button>
+        <button type="button" data-view="sources"><span aria-hidden="true">▤</span>资料</button>
+      </nav>
+      <div class="sidebar-note"><span class="status-dot" id="model-dot"></span><span id="model-status">正在检查本地模型</span><small id="model-name">本地学习伙伴</small><p>课程与记忆保存在这台电脑。<br>你决定何时继续。</p></div>
+    </aside>
+    <main id="main" tabindex="-1">
+      <header class="topbar"><span id="date">今天</span><label class="course-label">当前课程<select id="course" aria-label="选择当前课程"><option value="">全部课程</option></select></label></header>
+      <p id="mobile-model-status" class="mobile-model-status" role="status">正在检查本地模型</p>
+      <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+      <section id="view-today" class="view" aria-labelledby="today-title">
+        <div class="eyebrow">从这里接着走</div>
+        <h1 id="today-title">不用赶进度，<br>先开始一小步。</h1>
+        <p class="intro">五到十分钟也算学习。今天，只做一件小事。</p>
+        <article class="today-task">
+          <div class="task-index" aria-hidden="true">01<span>今日小步</span></div>
+          <div class="task-content"><div class="eyebrow">你的下一步</div><h2 id="next-step">先花5分钟，查看一条课程通知。</h2><p id="reminder-body">从一条通知、一个问题，或一页笔记开始。</p><div class="actions"><button class="primary" id="start">现在开始 <span aria-hidden="true">↗</span></button><button class="secondary" id="snooze">15分钟后</button><button class="quiet" id="skip">今天休息</button></div><p id="reminder-status" class="hint" aria-live="polite"></p></div>
+        </article>
+        <div class="today-bottom"><article><div class="eyebrow">已经留下的线索</div><h2>把上次的想法接起来</h2><p id="summary">还没有学习记录。先问一个课程问题，或在记忆里记下你目前学到哪儿。</p><button class="text-button" data-view="memory">看看我的记忆 <span aria-hidden="true">→</span></button></article><article class="library-card"><div class="eyebrow">身边的资料</div><h2><span id="document-count">—</span> <small>份课程资料</small></h2><p>先从本地资料找依据。回答里会附上可以查看的出处。</p><button class="text-button" data-view="sources">浏览课程资料 <span aria-hidden="true">→</span></button></article></div>
+      </section>
+      <section id="view-learn" class="view" aria-labelledby="learn-title" hidden>
+        <div class="section-heading"><div><div class="eyebrow">一次解决一个问题</div><h1 id="learn-title">一起弄明白。</h1></div><button id="new-chat" class="secondary">新对话</button></div>
+        <p class="intro">用你自己的话提问，资料里的原句也可以。</p>
+        <div class="chat" id="chat" role="log" aria-label="学习对话" aria-live="polite"><div class="empty-state" id="chat-empty"><span aria-hidden="true">↗</span><h2>从一个具体问题开始</h2><p>例如：“这份课程通知里，我这周要做什么？”<br>回答是学习参考，实际进度由你在记忆中记录。</p></div></div>
+        <form id="chat-form" class="composer"><label for="question" class="sr-only">你的课程问题</label><textarea id="question" rows="3" maxlength="12000" placeholder="有什么想弄明白的？" required></textarea><div class="composer-options"><label class="checkbox"><input id="web" type="checkbox">联网查资料（仅发送本次问题）</label><button class="primary" id="send" type="submit">发送 <span aria-hidden="true">↑</span></button></div><label id="url-row" class="url-row" hidden>指定网页（可选）<input id="url" type="url" placeholder="https://…" aria-label="指定联网资料的网址"></label><p id="chat-status" class="hint" role="status" aria-live="polite">按发送开始提问；Ctrl / ⌘ + Enter 也可以。</p></form>
+      </section>
+      <section id="view-memory" class="view" aria-labelledby="memory-title" hidden>
+        <div class="eyebrow">留下真实的进度</div><h1 id="memory-title">下次，从这里继续。</h1><p class="intro">记录你做过什么、卡在哪里、接下来想做什么。模型回答不会自动算作完成。</p>
+        <form id="memory-form" class="panel"><label for="memory-content" id="memory-label">记下一条学习线索</label><textarea id="memory-content" rows="3" maxlength="12000" placeholder="例如：看完了第一章，但还没弄懂条件概率。" required></textarea><div class="memory-options"><label for="memory-kind">记录类型</label><select id="memory-kind"><option value="user_reported">我的实际进度</option><option value="next_step">下一步计划</option><option value="preference">学习偏好</option></select></div><div class="form-footer"><span class="hint" id="memory-target">保存到当前课程 · 由你记录</span><div class="memory-actions"><button class="quiet" id="cancel-correction" type="button" hidden>取消更正</button><button class="primary" id="save-memory">保存记忆</button></div></div></form>
+        <div class="list-heading"><h2>我的学习记忆</h2><span id="memory-count" class="hint"></span></div><div id="memory-list" class="memory-list" aria-live="polite"></div>
+        <details class="handoff"><summary>给 Codex 的学习交接</summary><p class="hint">Codex 可在学习请求开始时按需读取，也可以手动复制这段交接。</p><pre id="handoff-text">尚无交接内容。</pre><button class="secondary" id="copy-handoff">复制交接</button></details>
+      </section>
+      <section id="view-sources" class="view" aria-labelledby="sources-title" hidden>
+        <div class="section-heading"><div><div class="eyebrow">回答的依据在这里</div><h1 id="sources-title">翻翻课程资料。</h1></div><button class="secondary" id="reindex">刷新资料</button></div><p class="intro">检索这台电脑上的课程内容，打开查看原文。</p>
+        <form id="search-form" class="search"><label for="search" class="sr-only">搜索资料</label><input id="search" type="search" placeholder="输入关键词，或留空查看全部资料"><button class="primary" type="submit">搜索</button></form><p id="source-root" class="hint source-root"></p><div id="source-list" class="source-list" aria-live="polite"></div>
+      </section>
+      <footer>孙权 <span aria-hidden="true">·</span> 小步也在向前</footer>
+    </main>
+  </div>
+  <dialog id="source-dialog" aria-labelledby="source-title"><div class="dialog-heading"><h2 id="source-title">资料原文</h2><button id="close-source" class="secondary" aria-label="关闭资料原文">关闭 ×</button></div><p id="source-path" class="hint"></p><div id="source-preview" hidden></div><details id="source-text" open><summary id="source-text-label">资料文本</summary><pre id="source-content"></pre></details></dialog>
+</body>
+</html>

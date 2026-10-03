@@ -1,0 +1,6 @@
+{
+  "source_root": "C:/StudyMaterials",
+  "model": "qwen3.5:4b",
+  "port": 18765,
+  "ollama_port": 11435
+}

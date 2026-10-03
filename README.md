@@ -1,0 +1,120 @@
+# 孙权 · 本地学习搭子
+
+![孙权](web/sunquan-icon.png)
+
+取意“孙权劝学”：在电脑上回答学习问题、保存真实进度，在登录后轻轻提醒开始一小步。使用本地 Ollama 模型，不需要模型 API Key；联网查资料由用户逐次选择。
+
+## 能做什么
+
+- **本地答疑**：结合学习笔记和课程资料回答，保留对话及其来源；点击出处可以查看文本，有原页图片时也可查看。
+- **学习记忆**：保存进度、下一步、偏好和更正；区分助手讲解、本人掌握与实际提交。支持版本冲突检查、重复写入去重和删除标记。
+- **按次交接**：提供标准输入/输出 MCP 接口，供 Codex 等本地客户端在学习请求开始时读取，并按次交回新进度。
+- **可选联网**：读取公开 HTTPS 文本网页或免费搜索结果。搜索仅发送当前问题，模型推理仍在本机完成。
+- **登录提醒**：Windows 托盘运行，登录约 45 秒后提醒；可延后 15 分钟或选择今天休息。当天开始或休息后不再催促。
+
+Python 后端只使用标准库，前端无构建步骤。应用只监听 `127.0.0.1`，默认页面地址为 `http://127.0.0.1:18765/`。
+
+## 首次运行
+
+需要 Windows、Python 3.11+、Windows 自带的 PowerShell 与 `curl.exe`。在 Windows / Python 3.13 / Ollama 0.35.1 上完成过本地验收；硬件需求和回答速度取决于所选模型。
+
+### 1. 配置资料目录
+
+在仓库目录执行：
+
+```powershell
+Copy-Item settings.example.json settings.json
+```
+
+把 `settings.json` 的 `source_root` 改为自己**已存在的学习资料目录的绝对路径**。`C:/StudyMaterials` 是示例，请替换。当前模型示例为 `qwen3.5:4b`，两个端口应保持不同且未被占用。
+
+### 2. 准备本地模型
+
+按照 [Ollama Windows 官方说明](https://docs.ollama.com/windows)下载官方 standalone ZIP，并将运行文件解压到 `runtime/ollama/`，保证 `runtime/ollama/ollama.exe` 存在，同时保留需要的运行库。
+
+在仓库目录打开 PowerShell，启动本项目专用的 Ollama 服务：
+
+```powershell
+$env:OLLAMA_HOST = '127.0.0.1:11435'
+$env:OLLAMA_MODELS = Join-Path $PWD.Path 'models'
+$env:OLLAMA_NO_CLOUD = '1'
+.\runtime\ollama\ollama.exe serve
+```
+
+再打开一个 PowerShell 窗口，进入同一仓库目录下载模型：
+
+```powershell
+$env:OLLAMA_HOST = '127.0.0.1:11435'
+.\runtime\ollama\ollama.exe pull qwen3.5:4b
+```
+
+如果配置了不同模型或端口，相应调整上述命令。模型下载需要网络和磁盘空间；仓库不包含 Ollama 二进制或模型权重。代理或站点限制可能使下载失败，此时需先解决对应网络问题。
+
+下载完成后，可用 Ctrl+C 关闭手动启动的服务；应用会在提问时启动它，并在模型闲置约一分钟后卸载模型以释放资源。
+
+### 3. 打开孙权
+
+双击 `打开学习搭子.cmd`，或在仓库目录执行：
+
+```powershell
+.\launch.ps1
+```
+
+也可以仅启动网页服务：
+
+```powershell
+python -X utf8 app.py
+```
+
+随后访问 `http://127.0.0.1:18765/`。模型未准备好时，资料、记忆和提醒仍可使用，答疑会明确提示模型状态。
+
+### 4. 可选：桌面入口和登录提醒
+
+```powershell
+.\install-shortcuts.ps1
+```
+
+该脚本只为当前 Windows 用户创建桌面及启动目录快捷方式，不创建系统服务。取消登录提醒可运行 `关闭开机提醒.cmd`；退出当前程序请使用托盘菜单。“开机提醒”指用户登录，不是每次解锁。
+
+## 连接 Codex
+
+在已配置 MCP 的 Codex 客户端中注册本项目的 `bridge.py`。例如，在仓库目录执行：
+
+```powershell
+codex mcp add study-memory -- python -X utf8 "$PWD\bridge.py"
+```
+
+随后在新的学习会话中使用以下工具：
+
+| 工具 | 用途 |
+| --- | --- |
+| `study_snapshot` | 获取近期记忆、课程接续和近期对话；增量读取时返回删除标记与下一页版本 |
+| `study_search` | 检索本地资料、新增记忆与历史对话 |
+| `study_read` | 读取某条检索结果的完整内容 |
+| `study_commit` | 用证据、当前版本和唯一标识交回新增记忆或更正 |
+| `study_forget` | 停止使用一条主动保存的记忆，保留删除标记 |
+
+客户端应在学习请求开始时先读取，有新确认进度时再写回。仅打开客户端窗口不保证触发工具调用；本项目没有持续同步全部平台聊天的功能。
+
+## 资料与数据
+
+普通 Markdown/文本会直接建立索引。可选的课件索引位置为学习目录中的 `工具/课件搜索/generated/data.js`，格式示例见 `tests/test_core.py`。导入课件文本前会核对原件哈希，原件变化后需要先重新生成课件索引；本项目没有内置通用 PDF/PPT OCR 转换器。
+
+- `data/learning.sqlite3`：记忆、对话、资料索引与提醒状态。
+- `settings.json`：本机资料路径、模型和端口。
+- `models/`、`runtime/`：模型及运行组件。
+- 原始学习资料仍保存在配置的资料目录。备份本地记录时先退出托盘程序，再复制整个 `data/` 文件夹。
+
+上述私有数据、本机配置、运行日志、个人验收记录及模型文件均由 `.gitignore` 排除。界面截图或个人资料若另行加入仓库，仍应单独检查内容。
+
+## 开发与验证
+
+```powershell
+python -X utf8 -W error::ResourceWarning -m unittest discover -s tests -v
+```
+
+40 项行为测试使用临时文件和数据库，不调用真实模型或外网，不修改个人学习记录。覆盖课程隔离、中文检索、原件变化、记忆修订与删除、增量分页、MCP、来源持久化以及 HTTP 访问校验。
+
+本地小模型可能出现事实或推导错误，正式作业需要独立核验；本项目未实现多个不同模型的复核。公式当前以原始文本显示，课件公式可在已有原页图片中核对。
+
+图标由内置 imagegen 生成。
