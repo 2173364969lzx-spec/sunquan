@@ -75,7 +75,7 @@ def serve(root=ROOT,port=None):
             if not self.setup_input(): return self.output({"error":"仅允许本机访问。"},403)
             path=urllib.parse.urlsplit(self.path)
             args={k:v[0] for k,v in urllib.parse.parse_qs(path.query).items()}
-            if path.path=="/health": return self.output({"ok":True,"app":"孙权","version":"0.2.0"})
+            if path.path=="/health": return self.output({"ok":True,"app":"孙权","version":"0.3.0"})
             assets={"/":"index.html","/index.html":"index.html","/style.css":"style.css","/app.js":"app.js",
                     "/sunquan-icon.png":"sunquan-icon.png","/favicon.ico":"sunquan.ico"}
             if path.path in assets:
@@ -143,7 +143,9 @@ def serve(root=ROOT,port=None):
                 if path=="/api/study/check": return self.output({"run":study.check(data.get("id",""))})
                 if path=="/api/study/answer": return self.output({"run":study.answer(data.get("id",""),data.get("answers"),data.get("idempotency_key"))})
                 if path=="/api/study/feedback": return self.output({"run":study.feedback(data.get("id",""))})
-                if path=="/api/study/finish": return self.output({"run":study.finish(data.get("id",""),data.get("stuck_point",""))})
+                if path=="/api/study/finish":
+                    return self.output({"run":study.finish(data.get("id",""),data.get("stuck_point",""),
+                        skip_quiz=data.get("skip_quiz",False),stop_note=data.get("stop_note",""))})
                 if path=="/api/chat":
                     if data.get("study_run_id"):
                         run=study.get(data["study_run_id"])

@@ -199,7 +199,7 @@ async function sendQuestion(question, automatic=false) {
     const result=await api('/api/chat',{message:question,course:selected,session_id:run?.chat_session_id || sessions.get(selected),web,...(run?{study_run_id:run.id}:{}),...(web&&url?{url}:{})},220000);waiting.remove();
     if(result.session_id){sessions.set(selected,result.session_id);saveSessions();if(run)run.chat_session_id=result.session_id;}
     if(result.error || !result.answer || ['error','unavailable','offline','failed'].includes(result.status)){message('assistant',result.error || '本地模型暂时无法回答，你可以先阅读上面的资料，再用自己的话回答。',[],true);$('question').value=question;$('chat-status').textContent='这次提问未完成；原问题已保留，可以重试。';}
-    else {message('assistant',result.answer,result.sources || []);$('chat-status').textContent='回答供学习参考。准备好后，可以试着回答几个小问题。';}
+    else {message('assistant',result.answer,result.sources || []);const status=result.grounding?.status;$('chat-status').textContent=status==='cited'?'回答附有原文依据，可打开资料核对；引用不代表结论一定正确。小测可选，也可以今天到这。':status==='insufficient'?'当前资料依据不足，请留意回答中的说明；可以补充资料，或今天到这。':status==='invalid'?'这次回答的依据未通过检查，请按回答中的提示核对原文。小测可选。':'回答供学习参考，请核对资料。小测可选，也可以今天到这。';}
   }catch(error){waiting.remove();message('assistant',error.message,[],true);$('question').value=question;$('chat-status').textContent='这次提问未完成；原问题已保留，可以重试。';}
   finally{busy=false;updateLocks();loadState();}
 }
@@ -263,13 +263,31 @@ async function startStudy() {
   if(!result?.run)return;
   if(result.resumed){await loadHistory();notice('已接回这次小步，按原来的计划继续。');}
   else if(state?.model?.available){await loadHistory();await sendQuestion(studyRun.prompt,true);}
-  else{$('question').value=studyRun.prompt || ''; $('chat-status').textContent='本地模型暂未就绪。可以先阅读上面的原文，完成后做个小检查；原问题已保留。';}
+  else{$('question').value=studyRun.prompt || ''; $('chat-status').textContent='本地模型暂未就绪。可以先阅读上面的原文，小测可选，也可以今天到这；原问题已保留。';}
 }
 function runButton(label,action,cls='secondary') {const b=el('button',cls,label);b.type='button';b.addEventListener('click',action);return b;}
+function completionText(run) {
+  if(run.finish_mode==='note'||run.quiz_skipped){
+    if(run.stop_note?.trim())return '这次小步已结束，停点笔记已保存。';
+    return run.answers?'这次小步已结束，已提交的原回答和参考反馈仍保留。':'这次小步已结束；没有新增学习记录。';
+  }
+  return '这次作答和你填写的卡点已保存。';
+}
+function renderStopForm(panel,run) {
+  const draft=draftFor(run.id),section=el('div','stop-section'),form=el('form','stop-form');form.hidden=!draft.stopOpen;
+  const toggle=runButton('今天到这',()=>{const current=draftFor(run.id);current.stopOpen=!current.stopOpen;saveDraft(run.id,current);form.hidden=!current.stopOpen;toggle.setAttribute('aria-expanded',String(current.stopOpen));if(current.stopOpen)input.focus();});
+  toggle.setAttribute('aria-expanded',String(!form.hidden));toggle.setAttribute('aria-controls','stop-form');form.id='stop-form';
+  const label=el('label','','学到哪里／哪里卡住（可选）'),input=el('textarea');input.rows=2;input.maxLength=1000;input.value=draft.stopNote || '';input.placeholder='想留就写一句，也可以直接结束。';label.append(input);
+  const submit=el('button','primary',input.value.trim()?'保存并结束':'结束这次小步');submit.type='submit';
+  input.addEventListener('input',()=>{const current=draftFor(run.id);current.stopNote=input.value;saveDraft(run.id,current);submit.textContent=input.value.trim()?'保存并结束':'结束这次小步';});
+  form.append(label,el('p','hint','不需要做小测，也不需要填写笔记。未提交的小测草稿只留在这台浏览器，不会作为作答记录。'),submit);
+  form.addEventListener('submit',event=>{event.preventDefault();studyAction('/api/study/finish',{id:run.id,skip_quiz:true,stop_note:input.value,stuck_point:''},'正在结束这次小步…');});section.append(toggle,form);panel.append(section);
+}
 function renderRun() {
   const panel=$('study-panel'),run=studyRun;panel.replaceChildren();panel.hidden=!run;
   if(!run)return;
   panel.append(el('div','eyebrow',run.course+' · 计划 '+run.minutes+' 分钟'),el('h2','',run.title || '这次的小步'));
+  if(run.status!=='completed')renderStopForm(panel,run);
   if(run.context){const detail=el('details','study-excerpt');detail.append(el('summary','',run.context_label || '读回上次的线索'),el('p','study-context',run.context));panel.append(detail);}
   if(run.previous_question)panel.append(el('p','study-context','上次的问题：'+run.previous_question));
   if(run.steps?.length){const list=el('ol','study-steps');run.steps.forEach(step=>list.append(el('li','',step)));panel.append(list);}
@@ -277,10 +295,10 @@ function renderRun() {
   else panel.append(el('p','hint','这一步暂时没有匹配的资料。可以先整理问题，或到“资料”查找依据。'));
   const progress=el('div','study-progress');panel.append(progress);
   if(run.status==='active'){
-    progress.append(el('p','hint','看完这一小步后，用几个小问题检查自己的理解。'),runButton('试试几个小问题',()=>studyAction('/api/study/check',{id:run.id},'正在准备小问题，本地模型可能需要几分钟…')));
+    progress.append(el('p','hint','小测可选：想检查理解时，可以试试几个小问题；也可以今天到这。'),runButton('试试小测（可选）',()=>studyAction('/api/study/check',{id:run.id},'正在准备小问题，本地模型可能需要几分钟…')));
   }else if(run.status==='quiz'&&!run.answers){
     const form=el('form','quiz-form'),draft=draftFor(run.id);
-    form.append(el('h3','','用自己的话回答'),el('p','hint',run.quiz?.note || '想不起来也可以如实写下，先留下你现在的理解。'));
+    form.append(el('h3','','小测（可选）· 用自己的话回答'),el('p','hint',run.quiz?.note || '想不起来也可以如实写下，先留下你现在的理解。'),el('p','hint','可以随时用上方“今天到这”结束，不必提交回答。'));
     (run.quiz?.questions || []).forEach(q=>{const label=el('label','quiz-question',q.question),input=el('textarea');input.rows=3;input.maxLength=2000;input.required=true;input.dataset.questionId=q.id;input.value=draft.answers?.[q.id] || '';label.append(input);form.append(label);input.addEventListener('input',()=>{const current=draftFor(run.id);current.answers={...current.answers,[q.id]:input.value};saveDraft(run.id,current);});});
     const submit=el('button','primary','保存原回答并查看参考反馈');submit.type='submit';form.append(submit);
     form.addEventListener('submit',event=>{event.preventDefault();const answers=[...form.querySelectorAll('textarea')].map(n=>({id:n.dataset.questionId,answer:n.value}));if(!answers.length)return;
@@ -301,7 +319,11 @@ function renderRun() {
     }
   }
   if(run.status==='completed'){
-    progress.append(el('p','completion','这次作答和你确认的卡点已保存。'),el('p','hint',run.stuck_point?'你确认的卡点：'+run.stuck_point:'你确认这次没有要记录的卡点。'),runButton('再来一个小步',async()=>{studyRun=null;detached=false;renderRun();showView('today',true);await loadPlan();}));
+    progress.append(el('p','completion',completionText(run)));
+    if(run.stop_note)progress.append(el('p','study-context','你留下的停点：'+run.stop_note));
+    if(run.stuck_point)progress.append(el('p','study-context','你填写的卡点：'+run.stuck_point));
+    if(run.quiz_skipped&&Object.values(draftFor(run.id).answers || {}).some(value=>String(value).trim()))progress.append(el('p','hint','未提交的小测草稿仍保留在这台浏览器，未计入作答记录。'));
+    progress.append(el('p','hint','结束或保存记录不代表已经掌握。'),runButton('再来一个小步',async()=>{studyRun=null;detached=false;renderRun();showView('today',true);await loadPlan();}));
   }
   updateLocks();
 }
@@ -311,10 +333,10 @@ async function studyAction(path,body,label) {
   studyBusy=true;updateLocks();notice(label);
   try{
     const result=await api(path,body,220000);if(selected!==course||studyRun?.id!==id)return;
-    studyRun=result.run;renderRun();notice(path.endsWith('/finish')?'这次作答已保存，下次可以接着这里继续。':'');
-    if(path.endsWith('/finish')){try{localStorage.removeItem('study-draft:'+id);}catch(_){} await loadState();detached=true;await loadPlan();detached=false;}
+    studyRun=result.run;renderRun();notice(path.endsWith('/finish')?completionText(studyRun):'');
+    if(path.endsWith('/finish')){if(!body.skip_quiz){try{localStorage.removeItem('study-draft:'+id);}catch(_){}} await loadState();detached=true;await loadPlan();detached=false;}
   }catch(error){
-    notice(error.message+' 可以重试，已保存的回答会保留。',true);
+    notice(error.message+' 可以重试；填写的草稿仍保留在这台浏览器。',true);
     try{const result=await api(query('/api/study/run',{id}));if(selected===course&&studyRun?.id===id){studyRun=result.run;renderRun();}}catch(_){}
   }finally{studyBusy=false;updateLocks();}
 }

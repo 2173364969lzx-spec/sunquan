@@ -466,7 +466,10 @@ class TutorTests(Fixture):
         def model_reply(path, payload=None, timeout=5):
             context = payload["messages"][0]["content"]
             numbers = [re.search(r"\[资料(\d+)\] " + re.escape(source["title"]), context).group(1) for source in network]
-            return {"message":{"content":"append 返回 None，参见" + "和".join("[资料" + number + "]" for number in numbers) + "。"}}
+            citations = [{'source_id':'web-'+hashlib.sha256(s['url'].encode()).hexdigest()[:18],
+                          'quote':s['excerpt'].split(': ')[-1]} for s in network]
+            return {"message":{"content":json.dumps({'supported':True,'explanation':'append 返回 None。',
+                'next_step':'请试着解释原地修改。','citations':citations},ensure_ascii=False)}}
 
         with patch.object(tutor, "ensure"), patch.object(tutor, "status", return_value={"available":True}), \
              patch.object(core, "web_search", return_value=network), \
@@ -662,6 +665,21 @@ class HTTPTests(Fixture):
         status, _, raw = self.request('GET', '/api/study/plan?course=Java&minutes=30', headers={'Cookie':self.cookie})
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(raw)['plan']['next_step'], '还不清楚泛型')
+
+    def test_stop_without_quiz_http_roundtrip(self):
+        _, _, raw = self.request('POST', '/api/study/start',
+            {'course':'Java','minutes':5,'idempotency_key':'http-stop-start'}, self.write_headers())
+        run = json.loads(raw)['run']
+        body = {'id':run['id'],'skip_quiz':True,'stop_note':'停在泛型的第一个例子'}
+        for _ in range(2):
+            status, _, raw = self.request('POST', '/api/study/finish', body, self.write_headers())
+            self.assertEqual(status, 200)
+            finished = json.loads(raw)['run']
+            self.assertIsNone(finished['answers'])
+            self.assertEqual(finished['status'], 'completed')
+        self.assertEqual(len(self.store.memories()), 1)
+        _, _, raw = self.request('GET', '/api/study/plan?course=Java', headers={'Cookie':self.cookie})
+        self.assertEqual(json.loads(raw)['plan']['next_step'], body['stop_note'])
 
     def test_study_chat_rejects_mismatched_course_and_session(self):
         status, _, raw = self.request('POST', '/api/study/start',

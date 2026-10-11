@@ -7,6 +7,7 @@ import threading
 import uuid
 
 from core import COURSES, compact, now
+from grounding import source_quote
 
 ACTIVE = ('active', 'quiz', 'answered')
 
@@ -22,19 +23,6 @@ def brief(value, limit=76):
     value = re.sub(r'[*`#]', '', value)
     value = re.sub(r'\s+', ' ', value).strip(' 。；')
     return value if len(value) <= limit else value[:limit - 1].rstrip(' ，；') + '…'
-
-
-def source_quote(quote, source):
-    """Allow formatting whitespace, but display the exact original source span."""
-    if quote in source:
-        return quote
-    positions = [i for i, char in enumerate(source) if not char.isspace()]
-    plain = ''.join(source[i] for i in positions)
-    target = ''.join(quote.split())
-    start = plain.find(target)
-    if not target or start < 0:
-        raise ValueError('反馈没有有效的原文依据。')
-    return source[positions[start]:positions[start + len(target) - 1] + 1]
 
 
 class StudyFlow:
@@ -96,12 +84,15 @@ class StudyFlow:
         previous = question['content'][:500] if question else ''
         reviewed = json.loads(review['payload']) if review and not review['deleted'] else None
         stuck = reviewed.get('stuck_point', '') if reviewed else ''
+        stop_note = reviewed.get('stop_note', '') if reviewed else ''
         next_memory = next((m for m in memories if m['kind'] == 'next_step'), None)
-        progress = next((m for m in memories if m['kind'] in {'user_reported', 'verified', 'correction'} and m['origin'] != 'study_check'), None)
+        progress = next((m for m in memories if m['kind'] in {'user_reported', 'verified', 'correction'} and m['origin'] not in {'study_check', 'study_stop'}), None)
         snap = self.store.snapshot(course)
         canonical = next((s for s in snap['sources'] if s.get('course') == course and not s['id'].startswith(('memory-', 'message-'))), None)
         if stuck:
             topic, label, context = stuck[:220], '你确认的卡点', stuck
+        elif stop_note:
+            topic, label, context = stop_note[:220], '你上次停在这里', stop_note
         elif next_memory:
             topic, label, context = next_memory['content'][:220], '你留下的下一步', next_memory['content']
         elif progress:
@@ -143,8 +134,8 @@ class StudyFlow:
             if len(sources) == 3: break
         steps = ([f'1分钟：读回这条线索，核对现在的停点。',
                   '3分钟：只解释一个概念，或尝试题目中的第一步。' if not easy else '3分钟：从资料里选一句，用自己的话解释；不清楚的地方先标出来。',
-                  '1分钟：做一个小检验，留下自己的回答和卡点。'] if minutes == 5 else
-                 ['5分钟：读回上次问题和相关资料，确定这一小节的目标。', '20分钟：围绕当前停点练习一道题或完成一个小步骤。', '5分钟：做两道小检验，记录需要再练的地方。'])
+                  '1分钟：可选做个小检验，或用“今天到这”留一句停点。'] if minutes == 5 else
+                 ['5分钟：读回上次问题和相关资料，确定这一小节的目标。', '20分钟：围绕当前停点练习一道题或完成一个小步骤。', '5分钟：可选做个小检验，或用“今天到这”结束。'])
         prompt = f'我们用{minutes}分钟学{course}。本次只做：{title}。请依据资料和下面的停点，从一个具体的小步骤带我开始；先给一个短提示，等我尝试后再继续，不要一次给完答案。\n停点线索：{context[:1000]}'
         plan = dict(course=course, minutes=minutes, easy=easy, title=title, nudge=nudge,
                     context_label=label, context=context[:1800], previous_question=previous,
@@ -178,9 +169,9 @@ class StudyFlow:
         sources = []
         for anchor in run['sources']:
             try:
-                item = self.store.read_source(anchor['id'])
+                item = self.store.evidence_source(anchor['id'])
                 sources.append({'id': item['id'], 'title': item['title'], 'content': item['content'][:2200]})
-            except ValueError:
+            except (OSError, ValueError):
                 pass
         history = self.store.history(run['chat_session_id'])[-4:]
         return {'task': run['next_step'], 'course': run['course'], 'sources': sources,
@@ -310,32 +301,45 @@ class StudyFlow:
         finally:
             self.generation.release()
 
-    def finish(self, run_id, stuck_point=''):
+    def finish(self, run_id, stuck_point='', *, skip_quiz=False, stop_note=''):
         stuck = text(stuck_point, 1000, '卡点', empty=True)
+        note = text(stop_note, 1000, '收尾记录', empty=True)
+        if not isinstance(skip_quiz, bool): raise ValueError('跳过检验选项无效。')
+        if note and not skip_quiz: raise ValueError('收尾记录请通过“今天到这”保存。')
+        mode = 'note' if skip_quiz else 'quiz'
         with self.store.connect() as cx:
             cx.execute('BEGIN IMMEDIATE')
             row = cx.execute('SELECT payload FROM study_runs WHERE id=?', (run_id,)).fetchone()
             if not row: raise ValueError('这次小任务不存在。')
             run = json.loads(row['payload'])
             if run['status'] == 'completed':
-                if run['stuck_point'] != stuck: raise ValueError('本次确认已保存，请在记忆中更正，避免覆盖。')
+                if (run['stuck_point'], run.get('stop_note', ''), run.get('finish_mode', 'quiz')) != (stuck, note, mode):
+                    raise ValueError('本次确认已保存，请在记忆中更正，避免覆盖。')
                 return run
-            if run['status'] != 'answered' or not run['answers']: raise ValueError('先留下自己的作答，再确认这次记录。')
+            if not skip_quiz and (run['status'] != 'answered' or not run['answers']):
+                raise ValueError('先留下自己的作答，或选择“今天到这”跳过检验。')
             stamp = now()
-            run.update(stuck_point=stuck, confirmed_at=stamp, updated_at=stamp, status='completed')
-            lines = [f'小检验记录：{run["title"]}', f'计划时长：{run["minutes"]}分钟（不代表实际用时）。',
-                     '以下为本人提交的原答；不据此自动判定掌握或作业已提交。']
-            for question, answer in zip(run['quiz']['questions'], run['answers']):
-                lines.extend([f'题目：{question["question"]}', '本人原答：' + answer['answer']])
-            lines.append('本人确认的卡点：' + (stuck or '本次未填写卡点；不表示已经掌握。'))
-            # Full model opinions remain in the run, distinct from the factual memory.
-            lines.append('模型反馈另存为参考意见，不作为本人掌握证据。')
-            memory_id = str(uuid.uuid4())
-            revision = self.store.bump(cx)
-            cx.execute('INSERT INTO memories VALUES(?,?,?,?,?,?,?,0,?,?,?)',
-                       (memory_id, run['course'], '\n'.join(lines), 'user_reported', stamp,
-                        'study_check', '本人在小检验中提交原答并点击确认；任务 ' + run_id,
-                        revision, 'study-finish:' + run_id, None))
+            run.update(stuck_point=stuck, stop_note=note, finish_mode=mode,
+                       quiz_skipped=not bool(run['answers']), confirmed_at=stamp, updated_at=stamp, status='completed')
+            memory_id = None
+            if run['answers'] or note or stuck:
+                lines = [f'{"学习收尾" if skip_quiz else "小检验"}记录：{run["title"]}',
+                         f'计划时长：{run["minutes"]}分钟（不代表实际用时）。',
+                         '只记录本人确认的内容；不据此自动判定掌握或作业已提交。']
+                if note: lines.append('本人留下的停点：' + note)
+                if run['answers']:
+                    for question, answer in zip(run['quiz']['questions'], run['answers']):
+                        lines.extend([f'题目：{question["question"]}', '本人原答：' + answer['answer']])
+                else:
+                    lines.append('本次跳过小检验，没有提交检验原答。')
+                if stuck: lines.append('本人确认的卡点：' + stuck)
+                lines.append('模型反馈另存为参考意见，不作为本人掌握证据。')
+                memory_id = str(uuid.uuid4())
+                revision = self.store.bump(cx)
+                cx.execute('INSERT INTO memories VALUES(?,?,?,?,?,?,?,0,?,?,?)',
+                           (memory_id, run['course'], '\n'.join(lines), 'user_reported', stamp,
+                            'study_stop' if skip_quiz else 'study_check', '本人点击确认收尾；任务 ' + run_id,
+                            revision, 'study-finish:' + run_id, None))
             run['memory_id'] = memory_id
             cx.execute('UPDATE study_runs SET status=?,updated_at=?,payload=?,memory_id=? WHERE id=?',
                        ('completed', stamp, compact(run), memory_id, run_id))
