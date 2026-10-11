@@ -3,6 +3,9 @@ const $ = id => document.getElementById(id);
 let activeView = 'today', course = '', state = null, busy = false;
 let memoryRequest = 0, sourceRequest = 0, historyRequest = 0;
 let memoryRevision = null, correction = null, sourceDetailRequest = 0;
+let memoryOffset = 0, memoryTotal = 0, memoryDetailRequest = 0;
+let pendingChat = null, chatJob = null, waitingMessage = null, pollTimer = null, elapsedTimer = null, jobChecking = false, jobOffline = false, elapsedAt = 0, jobEpoch = 0, restoringChat = false;
+try { pendingChat = JSON.parse(localStorage.getItem("study-pending-chat") || "null"); } catch (_) {}
 let plan = null, studyRun = null, planRequest = 0, studyBusy = false, detached = false, minutes = 5, easy = false;
 try { course = localStorage.getItem('study-course') || ''; } catch (_) {}
 const sessions = new Map();
@@ -55,7 +58,7 @@ async function api(path, body, timeout = 20000) {
   try {
     const response = await fetch(path, {credentials:'same-origin', signal:controller.signal, ...(body === undefined ? {} : {method:'POST', headers:{'Content-Type':'application/json','X-Study-Request':'1'}, body:JSON.stringify(body)})});
     let result; try { result = await response.json(); } catch (_) { throw new Error('服务返回了无法读取的内容，请稍后重试。'); }
-    if (!response.ok) throw new Error(result.error || '操作未完成，请稍后重试。');
+    if (!response.ok) { const error = new Error(result.error || '操作未完成，请稍后重试。'); error.status = response.status; throw error; }
     return result;
   } catch (error) { if (error.name === 'AbortError') throw new Error(timeout > 30000 ? '等待回答超时。本地模型可能仍在处理，请稍后重试。' : '连接超时，请确认学习伙伴仍在运行。'); if (error instanceof TypeError) throw new Error('暂时连接不到本地服务，请确认学习伙伴仍在运行。'); throw error;
   } finally { clearTimeout(timer); }
@@ -107,28 +110,69 @@ function cancelCorrection(clear = true) {
   if (clear) $('memory-content').value = '';
 }
 function editMemory(item) {
-  correction = {id:item.id,course:item.course,revision:memoryRevision};
+  correction = {id:item.id,course:item.course,revision:memoryRevision,kind:item.kind};
   $('memory-content').value = item.content; $('memory-kind').disabled = true; $('cancel-correction').hidden = false;
-  $('memory-label').textContent = '更正这条学习记忆'; $('memory-target').textContent = '更正保存到：' + item.course + ' · 原记录会被替换'; $('save-memory').textContent = '保存更正';
+  $('memory-label').textContent = '更正这条学习记忆'; $('memory-target').textContent = '更正保存到：' + item.course + ' · 旧版本会保留在历史中'; $('save-memory').textContent = '保存更正';
   $('memory-form').scrollIntoView({block:'nearest'}); $('memory-content').focus();
+}
+const memoryStatus = item => ({active:'生效',replaced:'已更正',revoked:'已撤销'}[item.status || 'active'] || item.status);
+const memoryOrigin = value => ({user:'你主动记录',Codex:'Codex 按次交回',codex:'Codex 按次交回',study_stop:'结束小步时的停点',study_check:'小测记录',study_answer:'你提交的小测回答',study_finish:'本次学习记录'}[value] || value || '来源未标明');
+function memoryEvidence(item) {
+  const data = item.evidence;
+  return typeof data === 'string' ? data : data ? JSON.stringify(data,null,2) : '未附加来源依据';
+}
+async function openMemory(id) {
+  const request=++memoryDetailRequest, target=$('memory-detail'); target.replaceChildren(el('p','loading','正在读取来源与版本…'));
+  if(!$('memory-dialog').open)$('memory-dialog').showModal();
+  try {
+    const data=await api(query('/api/memory/detail',{id}));if(request!==memoryDetailRequest)return;
+    target.replaceChildren(el('p','hint','版本按记录时间从旧到新排列。更正和撤销会停止旧版本的后续使用，历史与原始资料仍保留。'));
+    (data.versions || [data.item]).filter(Boolean).forEach((item,index)=>{
+      const card=el('article','memory-version');card.append(el('h3','','版本 '+(index+1)+' · '+memoryStatus(item)+(item.supersedes?' · 更正记录':'')),el('p','memory-content',item.content),el('p','hint',[item.course,memoryOrigin(item.origin),localDate(item.created_at)].filter(Boolean).join(' · ')),el('pre','memory-evidence',memoryEvidence(item)));target.append(card);
+    });
+  }catch(error){if(request===memoryDetailRequest)target.replaceChildren(el('p','error-text',error.message));}
+}
+async function loadCoverage() {
+  const target=$('memory-coverage');
+  try {
+    const data=await api('/api/memory/coverage');target.replaceChildren(el('h2','','记忆接入范围'),el('p','',`${data.documents ?? 0} 份资料 · ${data.pages ?? 0} 页 · ${data.text_documents ?? 0} 份文本`),el('p','hint',typeof data.scope==='string'?data.scope: data.scope?JSON.stringify(data.scope):'范围说明暂未提供。'),el('p','hint','未导出的 ChatGPT / Codex 平台聊天不在本地索引中。接入资料数不代表全部聊天历史。'),el('p','hint',data.checked_at?'最近核对：'+localDate(data.checked_at):'核对时间暂未提供。'));
+    const gaps=data.not_indexed || [], errors=data.errors || [];
+    target.append(el('p','hint',`未接入：${data.not_indexed_total ?? gaps.length} 项 · 读取错误：${errors.length} 项`));
+    if(gaps.length||errors.length){const details=el('details');details.append(el('summary','','查看缺口与错误'));[...gaps.map(i=>[i.path,i.reason].filter(Boolean).join(' · ')),...errors.map(i=>[i.path,i.error].filter(Boolean).join(' · '))].forEach(value=>details.append(el('p','hint',value)));target.append(details);}
+  }catch(error){target.replaceChildren(el('h2','','记忆接入范围'),el('p','error-text','暂时无法核对覆盖范围：'+error.message),el('p','hint','未导出的平台聊天不在本地索引中；当前接入数量尚未确认。'));}
 }
 async function loadMemory() {
   const request = ++memoryRequest, target = $('memory-list'); target.replaceChildren(el('p','loading','正在读取学习记忆…'));
+  loadCoverage();
   try {
-    const data = await api(query('/api/memory',{course})); if (request !== memoryRequest) return;
-    memoryRevision = data.revision;
-    $('memory-count').textContent = (data.items || []).length + ' 条';
+    const data = await api(query('/api/memory',{course,q:$('memory-search').value.trim(),state:$('memory-state').value,offset:memoryOffset,limit:30})); if (request !== memoryRequest) return;
+    memoryRevision = data.revision; memoryTotal=data.total ?? (data.items || []).length;
+    $('memory-count').textContent = memoryTotal + ' 条';$('memory-page').textContent=memoryTotal?`${memoryOffset+1}–${Math.min(memoryOffset+30,memoryTotal)} / ${memoryTotal}`:'0 条';$('memory-prev').disabled=memoryOffset===0;$('memory-next').disabled=memoryOffset+30>=memoryTotal;
     $('handoff-text').textContent = typeof data.handoff === 'string' ? data.handoff : data.handoff ? JSON.stringify(data.handoff,null,2) : '尚无交接内容。';
     target.replaceChildren();
-    if (!data.items?.length) { empty(target,'还没有新增学习记忆','原有课程档案已在“资料”中；这里显示你主动新增的记忆。记下真实进度，下次就能接着学。'); return; }
+    if (!data.items?.length) { empty(target,'这里没有匹配的记忆','可以调整关键词或查看历史记忆。原有课程档案仍在“资料”中。'); return; }
     data.items.forEach(item => {
-      const card = el('article','memory-item'), meta = el('div','memory-meta'), controls = el('div','memory-actions'), edit = el('button','text-button','更正'), remove = el('button','delete-memory','删除'); remove.type = 'button'; edit.type = 'button';
-      edit.setAttribute('aria-label','更正记忆：' + String(item.content).slice(0,30)); edit.addEventListener('click',()=>editMemory(item));
-      remove.setAttribute('aria-label','删除记忆：' + String(item.content).slice(0,30));
-      remove.addEventListener('click',async () => { if (!confirm('删除这条学习记忆？')) return; remove.disabled = true; try { await api('/api/memory/delete',{id:item.id}); if(correction?.id===item.id)cancelCorrection(); notice('记忆已删除。'); loadMemory(); loadState(); } catch(error) { notice(error.message,true); remove.disabled = false; } });
-      controls.append(edit,remove); const kindLabel = {user_reported:'实际进度',next_step:'下一步',preference:'学习偏好',correction:'更正',verified:'已核验'}[item.kind] || item.kind;
-      meta.append(el('span','hint',item.course + ' · ' + kindLabel + ' · ' + localDate(item.created_at)),controls);
-      card.append(el('p','',item.content),meta); target.append(card);
+      const card = el('article','memory-item'), meta = el('div','memory-meta'), controls = el('div','memory-actions'), detail=el('button','text-button','来源与历史');detail.type='button';detail.setAttribute('aria-label','查看记忆来源与历史：'+String(item.content).slice(0,30));detail.addEventListener('click',()=>openMemory(item.id));controls.append(detail);
+      if((item.status || 'active')==='active'){
+        const edit=el('button','text-button','更正'),remove=el('button','delete-memory','撤销');edit.type=remove.type='button';edit.setAttribute('aria-label','更正记忆：'+String(item.content).slice(0,30));edit.addEventListener('click',()=>editMemory(item));remove.setAttribute('aria-label','撤销记忆：'+String(item.content).slice(0,30));
+        const displayedRevision=data.revision;
+        remove.addEventListener('click',()=>{
+          remove.disabled=true;
+          const confirmPanel=el('div','revoke-confirmation'),actions=el('div','memory-actions'),confirmButton=el('button','secondary','确认撤销'),keep=el('button','quiet','保留'),reload=el('button','text-button','重新读取记忆'),errorText=el('p','error-text');
+          confirmPanel.setAttribute('role','group');confirmPanel.setAttribute('aria-label','确认撤销这条记忆');confirmButton.type=keep.type=reload.type='button';reload.hidden=true;errorText.hidden=true;errorText.setAttribute('role','status');
+          confirmPanel.append(el('p','hint','撤销后，这条记忆将停止用于后续学习接续。历史和原始资料仍保留，不会恢复被更正的旧版。'),actions,errorText);actions.append(confirmButton,keep,reload);card.append(confirmPanel);confirmButton.focus();
+          keep.addEventListener('click',()=>{confirmPanel.remove();remove.disabled=false;remove.focus();});
+          reload.addEventListener('click',()=>loadMemory());
+          confirmButton.addEventListener('click',async()=>{
+            confirmButton.disabled=keep.disabled=reload.disabled=edit.disabled=true;errorText.hidden=true;
+            try{await api('/api/memory/delete',{id:item.id,expected_revision:displayedRevision});if(correction?.id===item.id)cancelCorrection();notice('已撤销，历史与原始资料仍保留。');await loadMemory();loadState();loadPlan();}
+            catch(error){errorText.textContent=error.message+' 原记忆仍保留；请重新读取后核对当前版本。';errorText.hidden=false;reload.hidden=false;confirmButton.disabled=keep.disabled=reload.disabled=edit.disabled=false;}
+          });
+        });controls.append(edit,remove);
+      }
+      const kindLabel={user_reported:'实际进度',next_step:'下一步',preference:'学习偏好',correction:'更正',verified:'已核验'}[item.kind] || item.kind;
+      meta.append(el('span','hint',[item.course,kindLabel,memoryStatus(item),item.supersedes?'更正记录':'',memoryOrigin(item.origin),localDate(item.created_at)].filter(Boolean).join(' · ')),controls);
+      const evidence=el('details','memory-source');evidence.append(el('summary','','来源依据'),el('pre','memory-evidence',memoryEvidence(item)));card.append(el('p','',item.content),meta,evidence);target.append(card);
     });
   } catch(error) { if (request === memoryRequest) target.replaceChildren(el('p','error-text',error.message)); }
 }
@@ -175,6 +219,7 @@ async function loadHistory() {
 document.querySelectorAll('[data-view]').forEach(button=>button.addEventListener('click',()=>showView(button.dataset.view,true)));
 document.querySelector('.brand').addEventListener('click',event=>{event.preventDefault();showView('today',true);});
 $('course').addEventListener('change',()=>{
+  if(busy||studyBusy){$('course').value=course;return;}memoryOffset=0;
   course=$('course').value; try { localStorage.setItem('study-course',course); } catch (_) {}
   studyRun=null; plan=null; detached=false; ++historyRequest; ++memoryRequest; ++sourceRequest;
   renderRun(); if(correction)cancelCorrection(); notice(''); loadPlan();
@@ -188,29 +233,82 @@ $('course').addEventListener('change',()=>{
 $('web').addEventListener('change',()=>{$('url-row').hidden=!$('web').checked;});
 $('question').addEventListener('keydown',event=>{if(event.key==='Enter'&&(event.ctrlKey||event.metaKey)){event.preventDefault();$('chat-form').requestSubmit();}});
 $('chat-form').addEventListener('submit',event=>{event.preventDefault();sendQuestion($('question').value.trim());});
+function persistPending(value) { localStorage.setItem('study-pending-chat',JSON.stringify(value)); }
+function jobStatusText() {
+  if(!pendingChat)return;
+  const labels={retrieving:'正在检索资料',loading:'正在加载本地模型',generating:'正在生成回答',verifying:'正在核对回答与依据'};
+  const elapsed=Math.max(0,Math.floor((chatJob?.elapsed_seconds || 0)+(elapsedAt?(Date.now()-elapsedAt)/1000:0)));
+  const text=jobOffline?'连接暂时中断，任务仍保留。可重新检查或取消。':chatJob?.status==='cancelling'?'正在等待本地任务停止…':labels[chatJob?.stage] || '正在确认服务是否接收请求';
+  $('chat-status').textContent=text+' · 已等待 '+elapsed+' 秒';
+  if(waitingMessage)waitingMessage.querySelector('.message-text').textContent=text+'。回答核对完成后会显示。';
+}
+function beginWaiting(restored=false) {
+  busy=true;updateLocks();++historyRequest;
+  $('chat-job-actions').hidden=false;$('check-answer').hidden=true;$('retry-answer').hidden=true;$('cancel-answer').disabled=false;
+  if(restored)message('user',pendingChat.payload.message);
+  waitingMessage=message('assistant','正在确认请求…');waitingMessage.setAttribute('aria-busy','true');
+  clearInterval(elapsedTimer);elapsedTimer=setInterval(jobStatusText,1000);jobStatusText();
+}
+function pauseJob(error,canRetry=false) {
+  clearTimeout(pollTimer);jobOffline=true;jobStatusText();$('check-answer').hidden=false;$('retry-answer').hidden=!canRetry;
+  notice(error.message+' 原请求已保留，重新检查不会重复生成回答。',true);
+}
+function finishJob(job) {
+  const reloadCompletedHistory=restoringChat && job.status==='completed' && !!job.result?.answer && !job.result.error;
+  const saved=pendingChat, selected=saved.payload.course, run=studyRun?.id===saved.payload.study_run_id?studyRun:null;
+  clearTimeout(pollTimer);clearInterval(elapsedTimer);waitingMessage?.remove();waitingMessage=null;
+  if(job.status==='completed' && job.result?.answer && !job.result.error){
+    const result=job.result;if(result.session_id){sessions.set(selected,result.session_id);saveSessions();if(run)run.chat_session_id=result.session_id;}
+    if(!reloadCompletedHistory)message('assistant',result.answer,result.sources || []);
+    const grounding=result.grounding?.status;$('chat-status').textContent=grounding==='cited'?'回答附有原文依据，可打开资料核对；引用不代表结论一定正确。':grounding==='insufficient'?'当前资料依据不足，请核对回答中的说明。':grounding==='invalid'?'回答依据未通过检查，请核对原文。':'回答供学习参考，请核对资料。';
+  }else{
+    $('question').value=saved.payload.message;
+    const text=job.status==='cancelled'?'回答已取消，原问题已放回输入框。':job.status==='interrupted'?'本地服务重启使回答中断，原问题已恢复，可重新发送。':job.error || job.result?.error || '这次回答未完成，原问题已恢复。';
+    message('assistant',text,[],job.status!=='cancelled');$('chat-status').textContent=text;
+  }
+  pendingChat=null;chatJob=null;busy=false;jobOffline=false;$('chat-job-actions').hidden=true;try{localStorage.removeItem('study-pending-chat');}catch(_){}updateLocks();loadState();restoringChat=false;if(reloadCompletedHistory)loadHistory();
+}
+function applyJob(job) {
+  if(!pendingChat || job.id!==pendingChat.key)return;
+  chatJob=job;elapsedAt=Date.now();jobOffline=false;notice('');$('check-answer').hidden=true;$('retry-answer').hidden=true;$('cancel-answer').disabled=job.status==='cancelling';jobStatusText();
+  if(['completed','cancelled','failed','interrupted'].includes(job.status)){finishJob(job);return;}
+  clearTimeout(pollTimer);pollTimer=setTimeout(checkJob,1500);
+}
+async function checkJob() {
+  if(!pendingChat)return;if(jobChecking){clearTimeout(pollTimer);pollTimer=setTimeout(checkJob,1500);return;}jobChecking=true;const id=pendingChat.key, epoch=jobEpoch;
+  try{const job=await api(query('/api/chat/job',{id}));if(pendingChat?.key===id && epoch===jobEpoch)applyJob(job);}catch(error){if(pendingChat?.key===id && epoch===jobEpoch)pauseJob(error,error.status===404);}finally{jobChecking=false;}
+}
+async function startPendingJob() {
+  if(!pendingChat||jobChecking)return;jobChecking=true;const saved=pendingChat, epoch=jobEpoch;$('retry-answer').disabled=true;
+  try{const job=await api('/api/chat/start',{...saved.payload,idempotency_key:saved.key});if(pendingChat?.key===saved.key && epoch===jobEpoch)applyJob(job);}catch(error){if(pendingChat?.key===saved.key && epoch===jobEpoch){if(error.status>=400 && error.status<500)finishJob({status:'failed',error:error.message});else pauseJob(error,true);}}finally{jobChecking=false;$('retry-answer').disabled=false;}
+}
 async function sendQuestion(question, automatic=false) {
   if(!question||busy||studyBusy)return;
   const selected=studyRun?.course || course, run=studyRun, web=automatic?false:$('web').checked, url=$('url').value.trim();
   if(web&&url){try{const parsed=new URL(url);if(parsed.protocol!=='https:')throw new Error();}catch(_){notice('请输入公开的 https 网页地址。',true);return;}}
-  busy=true; ++historyRequest; updateLocks(); $('question').value='';notice('');message('user',question);
-  $('chat-status').textContent='本地模型正在处理，首次加载可能需要几分钟…';
-  const waiting=message('assistant','正在读取资料并等待本地模型回答…');waiting.setAttribute('aria-busy','true');
-  try {
-    const result=await api('/api/chat',{message:question,course:selected,session_id:run?.chat_session_id || sessions.get(selected),web,...(run?{study_run_id:run.id}:{}),...(web&&url?{url}:{})},220000);waiting.remove();
-    if(result.session_id){sessions.set(selected,result.session_id);saveSessions();if(run)run.chat_session_id=result.session_id;}
-    if(result.error || !result.answer || ['error','unavailable','offline','failed'].includes(result.status)){message('assistant',result.error || '本地模型暂时无法回答，你可以先阅读上面的资料，再用自己的话回答。',[],true);$('question').value=question;$('chat-status').textContent='这次提问未完成；原问题已保留，可以重试。';}
-    else {message('assistant',result.answer,result.sources || []);const status=result.grounding?.status;$('chat-status').textContent=status==='cited'?'回答附有原文依据，可打开资料核对；引用不代表结论一定正确。小测可选，也可以今天到这。':status==='insufficient'?'当前资料依据不足，请留意回答中的说明；可以补充资料，或今天到这。':status==='invalid'?'这次回答的依据未通过检查，请按回答中的提示核对原文。小测可选。':'回答供学习参考，请核对资料。小测可选，也可以今天到这。';}
-  }catch(error){waiting.remove();message('assistant',error.message,[],true);$('question').value=question;$('chat-status').textContent='这次提问未完成；原问题已保留，可以重试。';}
-  finally{busy=false;updateLocks();loadState();}
+  const saved={key:key(),payload:{message:question,course:selected,session_id:run?.chat_session_id || sessions.get(selected),web,...(run?{study_run_id:run.id}:{}),...(web&&url?{url}:{})}};
+  try{persistPending(saved);}catch(_){notice('浏览器无法保存待处理请求。请允许本地存储后再发送，以便中断后恢复。',true);return;}
+  pendingChat=saved;chatJob=null;elapsedAt=Date.now();jobOffline=false;$('question').value='';notice('');message('user',question);beginWaiting();await startPendingJob();
 }
+$('check-answer').addEventListener('click',checkJob);
+$('retry-answer').addEventListener('click',startPendingJob);
+$('cancel-answer').addEventListener('click',async()=>{
+  if(!pendingChat)return;const id=pendingChat.key;++jobEpoch;$('cancel-answer').disabled=true;clearTimeout(pollTimer);
+  try{const job=await api('/api/chat/cancel',{id});if(pendingChat?.key===id)applyJob(job);}catch(error){if(pendingChat?.key===id){$('cancel-answer').disabled=false;pauseJob(error,error.status===404);}}
+});
 $('new-chat').addEventListener('click',()=>{
   if(busy||studyBusy)return; detached=true;studyRun=null;renderRun();sessions.delete(course);saveSessions();++historyRequest;resetChat();$('question').value='';$('chat-status').textContent='新对话已准备好。今日的小步仍可继续。';$('question').focus();
 });
 $('memory-form').addEventListener('submit',async event=>{
   event.preventDefault();const content=$('memory-content').value.trim();if(!content)return;$('save-memory').disabled=true;
   const editing=correction, selected=course;
-  try{await api('/api/memory',{content,course:editing ? editing.course : selected,kind:editing ? 'correction' : $('memory-kind').value,idempotency_key:key(),...(editing?{supersedes:editing.id,expected_revision:editing.revision}:{})});cancelCorrection();notice(editing?'更正已保存，旧记录已停止使用。':'已留下这条学习记忆。');loadMemory();loadState();}catch(error){notice(error.message + (editing?' 更正尚未保存；请重新读取记忆并确认版本。':''),true);}finally{$('save-memory').disabled=false;}
+  try{await api('/api/memory',{content,course:editing ? editing.course : selected,kind:editing ? editing.kind : $('memory-kind').value,idempotency_key:key(),...(editing?{supersedes:editing.id,expected_revision:editing.revision}:{})});cancelCorrection();notice(editing?'更正已保存，旧记录已停止使用。':'已留下这条学习记忆。');loadMemory();loadState();loadPlan();}catch(error){notice(error.message + (editing?' 更正尚未保存；请重新读取记忆并确认版本。':''),true);}finally{$('save-memory').disabled=false;}
 });
+$('memory-search-form').addEventListener('submit',event=>{event.preventDefault();memoryOffset=0;loadMemory();});
+$('memory-state').addEventListener('change',()=>{memoryOffset=0;loadMemory();});
+$('memory-prev').addEventListener('click',()=>{memoryOffset=Math.max(0,memoryOffset-30);loadMemory();});
+$('memory-next').addEventListener('click',()=>{memoryOffset+=30;loadMemory();});
+$('close-memory').addEventListener('click',()=>{$('memory-dialog').close();++memoryDetailRequest;});
 $('cancel-correction').addEventListener('click',()=>cancelCorrection());
 $('copy-handoff').addEventListener('click',async()=>{try{await navigator.clipboard.writeText($('handoff-text').textContent);notice('学习交接已复制。');}catch(_){notice('无法自动复制，请选中交接文字后复制。',true);}});
 $('search-form').addEventListener('submit',event=>{event.preventDefault();loadSources();});
@@ -223,6 +321,7 @@ $('source-dialog').addEventListener('click',event=>{if(event.target===$('source-
 function updateLocks() {
   const locked=busy||studyBusy;
   ['course','send','new-chat','easy','plan-retry'].forEach(id=>$(id).disabled=locked);
+  ['question','web','url'].forEach(id=>$(id).disabled=busy);
   $('start').disabled=locked||!plan;
   document.querySelectorAll('[name="minutes"]').forEach(n=>n.disabled=locked);
   $('study-panel').querySelectorAll('button,textarea').forEach(n=>n.disabled=locked);
@@ -348,7 +447,14 @@ async function initialize() {
   const launch=new URLSearchParams(location.search), requested=launch.get('study');
   if(['5','30'].includes(requested)){minutes=Number(requested);easy=launch.get('easy')==='1';if(easy)minutes=5;}
   document.querySelectorAll('[name="minutes"]').forEach(n=>n.checked=Number(n.value)===minutes);
-  await loadState();if(!state)return;await loadPlan();
+  if(pendingChat?.key && pendingChat.payload?.message){course=pendingChat.payload.course || '';busy=true;restoringChat=true;updateLocks();}else pendingChat=null;
+  await loadState();if(!state){if(pendingChat){showView('learn');beginWaiting(true);pauseJob(new Error('暂时连接不到本地服务。'));}return;}await loadPlan();
+  if(pendingChat){
+    showView('learn');resetChat();
+    try{const job=await api(query('/api/chat/job',{id:pendingChat.key}));if(job.status==='completed'){finishJob(job);}else{beginWaiting(true);applyJob(job);}}
+    catch(error){beginWaiting(true);pauseJob(error,error.status===404);}
+    return;
+  }
   if(['5','30'].includes(requested)&&plan){history.replaceState(null,'',location.pathname+location.hash);await startStudy();}
 }
 initialize();

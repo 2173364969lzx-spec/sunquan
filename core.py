@@ -24,6 +24,7 @@ from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from grounding import INSTRUCTION as GROUNDING_INSTRUCTION, render_answer
+from generation import RequestControl
 
 TZ = timezone(timedelta(hours=8))
 COURSES = ["综合", "CS50P", "大物", "离散数学", "计算机组成", "Java", "数据结构", "英语六级"]
@@ -242,7 +243,7 @@ class Store:
                     rows=list(rows)+[r for r in extra if r['id'] not in seen]
                 if not sources_only:
                     clause=" OR ".join("instr(lower(content),?)>0" for _ in ts)
-                    memory_rows=cx.execute("SELECT * FROM memories WHERE deleted=0 AND (?='' OR course=? OR course='综合') AND ("+clause+") ORDER BY revision DESC LIMIT ?",(course,course,*ts,min(limit,6))).fetchall()
+                    memory_rows=cx.execute("SELECT * FROM memories WHERE deleted=0 AND NOT EXISTS (SELECT 1 FROM memories newer WHERE newer.supersedes=memories.id) AND (?='' OR course=? OR course='综合') AND ("+clause+") ORDER BY revision DESC LIMIT ?",(course,course,*ts,min(limit,6))).fetchall()
                     chat_rows=cx.execute("SELECT m.*,s.course FROM messages m JOIN sessions s ON s.id=m.session_id WHERE (?='' OR s.course=? OR s.course='综合') AND ("+clause+") ORDER BY m.id DESC LIMIT 2",(course,course,*ts)).fetchall()
             result=[]
             for row in memory_rows:
@@ -276,7 +277,7 @@ class Store:
                 if not row: raise ValueError("对话不存在。")
                 return {**dict(row),"id":key,"title":"历史对话 · "+("本人提问" if row['role']=='user' else "助手回答（未独立核验）"),"path":"历史对话/"+row['session_id'],"page":0}
             if key.startswith("memory-"):
-                row=cx.execute("SELECT * FROM memories WHERE id=? AND deleted=0",(key[7:],)).fetchone()
+                row=cx.execute("SELECT * FROM memories WHERE id=? AND deleted=0 AND NOT EXISTS (SELECT 1 FROM memories newer WHERE newer.supersedes=memories.id)",(key[7:],)).fetchone()
                 if not row: raise ValueError("记忆不存在或已被删除。")
                 return {**dict(row),"id":key,"title":"已保存的学习记忆","path":"新增记忆/"+row['course'],"page":0}
             row=cx.execute("SELECT * FROM sources WHERE id=? AND active=1",(key,)).fetchone()
@@ -286,7 +287,81 @@ class Store:
 
     def memories(self, course="", limit=80):
         with self.connect() as cx:
-            return [dict(r) for r in cx.execute("SELECT * FROM memories WHERE deleted=0 AND (?='' OR course=? OR course='综合') ORDER BY revision DESC LIMIT ?",(course,course,min(int(limit),200)))]
+            return [dict(r) for r in cx.execute("SELECT * FROM memories WHERE deleted=0 AND NOT EXISTS (SELECT 1 FROM memories newer WHERE newer.supersedes=memories.id) AND (?='' OR course=? OR course='综合') ORDER BY revision DESC LIMIT ?",(course,course,min(int(limit),200)))]
+
+    @staticmethod
+    def _memory_status(cx, row):
+        item = dict(row)
+        replaced = cx.execute('SELECT 1 FROM memories WHERE supersedes=? LIMIT 1', (item['id'],)).fetchone()
+        item['status'] = 'replaced' if replaced else ('revoked' if item['deleted'] else 'active')
+        return item
+
+    @staticmethod
+    def _memory_versions(cx, mid):
+        """A single correction lineage, ordered oldest first; revoked leaves stay revoked."""
+        row = cx.execute('SELECT * FROM memories WHERE id=?', (mid,)).fetchone()
+        if not row:
+            raise ValueError('记录不存在。')
+        visited = set()
+        while row['supersedes']:
+            if row['id'] in visited:
+                raise ValueError('记忆版本关系无效。')
+            visited.add(row['id'])
+            parent = cx.execute('SELECT * FROM memories WHERE id=?', (row['supersedes'],)).fetchone()
+            if not parent:
+                raise ValueError('记忆版本关系无效。')
+            row = parent
+        versions, visited = [], set()
+        while row:
+            if row['id'] in visited:
+                raise ValueError('记忆版本关系无效。')
+            visited.add(row['id'])
+            versions.append(Store._memory_status(cx, row))
+            children = cx.execute('SELECT * FROM memories WHERE supersedes=? ORDER BY revision,id', (row['id'],)).fetchall()
+            if len(children) > 1:
+                raise ValueError('记忆版本关系无效。')
+            row = children[0] if children else None
+        return versions
+
+    @staticmethod
+    def _revision_value(value):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError('记录版本必须为非负整数。')
+        return value
+
+    def memory_page(self, course='', query='', state='active', offset=0, limit=30):
+        if course and course not in COURSES:
+            raise ValueError('未知课程。')
+        if not isinstance(query, str) or len(query) > 12000:
+            raise ValueError('搜索内容无效。')
+        if state not in {'active', 'history', 'all'}:
+            raise ValueError('未知记忆状态。')
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ValueError('分页起点必须为非负整数。')
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValueError('每页数量必须为1–100的整数。')
+        active = 'deleted=0 AND NOT EXISTS (SELECT 1 FROM memories newer WHERE newer.supersedes=memories.id)'
+        clause = "(?='' OR course=? OR course='综合') AND instr(lower(content),lower(?))>0"
+        if state != 'all':
+            clause += ' AND (' + (active if state == 'active' else 'NOT (' + active + ')') + ')'
+        params = (course, course, query.strip())
+        with self.connect() as cx:
+            cx.execute('BEGIN')
+            revision = self.revision(cx)
+            total = cx.execute('SELECT COUNT(*) FROM memories WHERE ' + clause, params).fetchone()[0]
+            rows = cx.execute('SELECT * FROM memories WHERE ' + clause + ' ORDER BY revision DESC,id LIMIT ? OFFSET ?',
+                              (*params, limit, offset)).fetchall()
+            items = [self._memory_status(cx, row) for row in rows]
+        return dict(revision=revision, items=items, total=total, offset=offset, limit=limit)
+
+    def memory_detail(self, mid):
+        if not isinstance(mid, str) or not mid:
+            raise ValueError('记录不存在。')
+        with self.connect() as cx:
+            cx.execute('BEGIN')
+            versions = self._memory_versions(cx, mid)
+            return {'item': next(item for item in versions if item['id'] == mid),
+                    'versions': versions, 'versions_order': 'oldest_first', 'revision': self.revision(cx)}
 
     def evidence_source(self, key):
         """Only original, unchanged materials may ground a course explanation."""
@@ -312,6 +387,8 @@ class Store:
         return source
 
     def remember(self, content, course="综合", kind="user_reported", origin="user", evidence="本人录入", idempotency_key=None, expected_revision=None, supersedes=None):
+        if not isinstance(content, str):
+            raise ValueError("记忆需为 1–12000 字。")
         content=content.strip()
         if not content or len(content)>12000:
             raise ValueError("记忆需为 1–12000 字。")
@@ -324,17 +401,27 @@ class Store:
             cx.execute("BEGIN IMMEDIATE")
             existing=cx.execute("SELECT * FROM memories WHERE idempotency_key=?",(key,)).fetchone()
             if existing:
-                if existing["content"] != content or existing["course"] != course:
+                effective_kind = kind
+                if supersedes:
+                    parent = cx.execute('SELECT kind FROM memories WHERE id=?', (supersedes,)).fetchone()
+                    if parent:
+                        if kind not in {'correction', parent['kind']}:
+                            raise ValueError('更正须保留原记录类型。')
+                        effective_kind = parent['kind']
+                if (existing['content'], existing['course'], existing['kind'], existing['supersedes'], existing['origin'], existing['evidence']) != (content, course, effective_kind, supersedes, origin, evidence):
                     raise ValueError("同一交接标识对应了不同内容，请保留原记录并重新提交。")
                 return dict(existing)
-            if expected_revision is not None and int(expected_revision)!=self.revision(cx):
+            if expected_revision is not None and self._revision_value(expected_revision)!=self.revision(cx):
                 raise ValueError("学习记录已经变化，请重新读取后再提交，避免覆盖新进度。")
             if supersedes:
-                previous=cx.execute("SELECT * FROM memories WHERE id=? AND deleted=0",(supersedes,)).fetchone()
+                previous=cx.execute("SELECT * FROM memories WHERE id=? AND deleted=0 AND NOT EXISTS (SELECT 1 FROM memories newer WHERE newer.supersedes=memories.id)",(supersedes,)).fetchone()
                 if not previous:
                     raise ValueError("待纠正记录不存在。")
                 if previous['course']!=course:
                     raise ValueError("更正须保留原记录的课程。")
+                if kind not in {'correction', previous['kind']}:
+                    raise ValueError('更正须保留原记录类型。')
+                kind = previous['kind']
             rev=self.bump(cx)
             if supersedes:
                 cx.execute("UPDATE memories SET deleted=1,revision=? WHERE id=?",(rev,supersedes))
@@ -342,26 +429,33 @@ class Store:
             cx.execute("INSERT INTO memories VALUES(?,?,?,?,?,?,?,0,?,?,?)",(mid,course,content,kind,now(),origin,evidence,rev,key,supersedes))
             return dict(cx.execute("SELECT * FROM memories WHERE id=?",(mid,)).fetchone())
 
-    def forget(self, mid):
+    def forget(self, mid, expected_revision=None):
+        if not isinstance(mid, str) or not mid:
+            raise ValueError('记录不存在。')
+        if expected_revision is not None:
+            self._revision_value(expected_revision)
         with self.connect() as cx:
             cx.execute("BEGIN IMMEDIATE")
             row=cx.execute("SELECT deleted FROM memories WHERE id=?",(mid,)).fetchone()
             if not row:
                 raise ValueError("记录不存在。")
             if not row[0]:
+                if expected_revision is not None and expected_revision != self.revision(cx):
+                    raise ValueError("学习记录已经变化，请重新读取后再提交，避免覆盖新进度。")
                 rev=self.bump(cx)
                 cx.execute("UPDATE memories SET deleted=1,revision=? WHERE id=?",(rev,mid))
-        return {"ok":True,"revision":self.revision()}
+            return {"ok":True,"revision":self.revision(cx)}
 
     def snapshot(self, course="", since_revision=None):
         if course and course not in COURSES: raise ValueError("未知课程。")
-        memories=self.memories(course,80)
         with self.connect() as cx:
+            cx.execute('BEGIN')
+            memories=[dict(r) for r in cx.execute("SELECT * FROM memories WHERE deleted=0 AND NOT EXISTS (SELECT 1 FROM memories newer WHERE newer.supersedes=memories.id) AND (?='' OR course=? OR course='综合') ORDER BY revision DESC LIMIT 80",(course,course))]
             rev=self.revision(cx)
             changed=cx.execute("SELECT value FROM meta WHERE key='updated_at'").fetchone()
             count=cx.execute("SELECT COUNT(*) FROM sources WHERE active=1").fetchone()[0]
-            memory_count=cx.execute("SELECT COUNT(*) FROM memories WHERE deleted=0 AND (?='' OR course=? OR course='综合')",(course,course)).fetchone()[0]
-            next_row=cx.execute("SELECT content FROM memories WHERE deleted=0 AND kind='next_step' AND (?='' OR course=? OR course='综合') ORDER BY revision DESC LIMIT 1",(course,course)).fetchone()
+            memory_count=cx.execute("SELECT COUNT(*) FROM memories WHERE deleted=0 AND NOT EXISTS (SELECT 1 FROM memories newer WHERE newer.supersedes=memories.id) AND (?='' OR course=? OR course='综合')",(course,course)).fetchone()[0]
+            next_row=cx.execute("SELECT content FROM memories WHERE deleted=0 AND NOT EXISTS (SELECT 1 FROM memories newer WHERE newer.supersedes=memories.id) AND kind='next_step' AND (?='' OR course=? OR course='综合') ORDER BY revision DESC LIMIT 1",(course,course)).fetchone()
             if since_revision is None:
                 visible=memories;deleted=[];truncated=memory_count>len(memories);next_revision=rev
             else:
@@ -372,8 +466,8 @@ class Store:
                     boundary=changes[79]['revision']
                     changes=[dict(r) for r in cx.execute("SELECT * FROM memories WHERE revision>? AND revision<=? AND (?='' OR course=? OR course='综合') ORDER BY revision,id",(int(since_revision),boundary,course,course))]
                     truncated=cx.execute("SELECT 1 FROM memories WHERE revision>? AND (?='' OR course=? OR course='综合') LIMIT 1",(boundary,course,course)).fetchone() is not None
-                visible=[r for r in changes if not r['deleted']]
-                deleted=[r['id'] for r in changes if r['deleted']]
+                visible=[r for r in changes if self._memory_status(cx,r)['status']=='active']
+                deleted=[r['id'] for r in changes if self._memory_status(cx,r)['status']!='active']
                 next_revision=changes[-1]['revision'] if truncated else rev
             path="LEARNING_HANDOFF.md" if course=="CS50P" else (f"课程/{course}/接续.md" if course and course!="综合" else "学习入口.md")
             canonical=cx.execute("SELECT * FROM sources WHERE active=1 AND page=0 AND path=?",(path,)).fetchone()
@@ -439,7 +533,7 @@ class Store:
         with self.connect() as cx:
             return {"documents":cx.execute("SELECT COUNT(DISTINCT path) FROM sources WHERE active=1").fetchone()[0],
                     "pages":cx.execute("SELECT COUNT(*) FROM sources WHERE active=1 AND page>0").fetchone()[0],
-                    "memories":cx.execute("SELECT COUNT(*) FROM memories WHERE deleted=0").fetchone()[0],
+                    "memories":cx.execute("SELECT COUNT(*) FROM memories WHERE deleted=0 AND NOT EXISTS (SELECT 1 FROM memories newer WHERE newer.supersedes=memories.id)").fetchone()[0],
                     "sessions":cx.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]}
 
 
@@ -546,6 +640,64 @@ class Tutor:
                                    headers={"Content-Type":"application/json"})
         with urllib.request.urlopen(req,timeout=timeout) as response:
             return json.load(response)
+    def stream_chat(self, payload, control):
+        """Collect bounded JSON privately; closing this socket cancels only this call."""
+        endpoint = urllib.parse.urlsplit(self.base)
+        connection = http.client.HTTPConnection(endpoint.hostname, endpoint.port, timeout=180)
+        timer = None
+        wire = None
+        response = None
+        timed_out = threading.Event()
+        def expire():
+            timed_out.set()
+            if wire:
+                try: wire.shutdown(socket.SHUT_RDWR)
+                except OSError: pass
+                connection.close()
+        try:
+            control.check()
+            connection.connect()
+            wire = connection.sock
+            control.attach(connection)
+            timer = threading.Timer(180, expire)
+            timer.daemon = True
+            timer.start()
+            connection.request('POST', '/api/chat', compact({**payload, 'stream': True}).encode('utf-8'),
+                               {'Content-Type': 'application/json'})
+            response = connection.getresponse()
+            if response.status != 200:
+                raise ValueError(f'本地模型请求失败（{response.status}），请稍后重试。')
+            chunks, size, final = [], 0, None
+            while True:
+                control.check()
+                line = response.readline(65537)
+                if not line: break
+                if len(line) > 65536: raise ValueError('模型返回内容超出范围。')
+                part = json.loads(line)
+                if part.get('error'): raise ValueError('本地模型未能完成这次回答。')
+                piece = part.get('message', {}).get('content', '')
+                if not isinstance(piece, str): raise ValueError('模型返回格式不完整。')
+                if piece and not size: control.stage('generating')
+                size += len(piece)
+                if size > 24000: raise ValueError('模型返回内容超出范围。')
+                chunks.append(piece)
+                if part.get('done') is True:
+                    final = part
+                    break
+            control.check()
+            if timed_out.is_set(): raise ValueError('本地模型等待超时，请缩小问题后重试。')
+            if final is None: raise ValueError('本地模型连接中断，这次回答未保存。')
+            if final.get('done_reason') == 'length':
+                raise ValueError('这次回答超过简短回答的长度，请把问题缩小到一个概念。')
+            return {**final, 'message': {'content': ''.join(chunks)}}
+        except (OSError, http.client.HTTPException) as exc:
+            control.check()
+            raise ValueError('本地模型连接中断或等待超时，这次回答未保存。') from exc
+        finally:
+            if timer: timer.cancel()
+            control.detach()
+            if response: response.close()
+            connection.close()
     def status(self):
         try:
             models=self.rpc("/api/tags",timeout=1).get("models",[])
@@ -554,7 +706,7 @@ class Tutor:
         except (OSError,ValueError):
             ready=(self.store.root/"runtime/ollama/ollama.exe").exists() and (self.store.root/"models/manifests/registry.ollama.ai/library"/self.model.split(":")[0]/self.model.split(":")[-1]).exists()
             return {"name":self.model,"available":ready,"status":"待机 · 提问时加载" if ready else "本地模型准备中"}
-    def ensure(self):
+    def ensure(self, control=None):
         try:
             self.rpc("/api/version",timeout=1); return
         except (OSError,ValueError): pass
@@ -571,26 +723,28 @@ class Tutor:
                                       creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0))
         log.close()
         for _ in range(30):
+            if control: control.check()
             time.sleep(.3)
             try:
                 self.rpc("/api/version",timeout=1); return
             except (OSError,ValueError): pass
         raise ValueError("本地模型未能启动，请查看运行状态或重新打开。")
-    def answer(self,message,course="综合",session_id=None,web=False,url="",study_context=""):
+    def answer(self,message,course="综合",session_id=None,web=False,url="",study_context="", *, control=None, persist=True):
         if not message.strip() or len(message)>8000: raise ValueError("问题需为 1–8000 字。")
         if course not in COURSES: raise ValueError("未知课程。")
         if not self.lock.acquire(blocking=False): raise ValueError("正在回答上一题，请等它完成后再问。")
+        request = control or RequestControl()
         try:
-            self.ensure()
-            if not self.status()["available"]: raise ValueError("模型还在准备，暂时不能生成回答。")
+            request.stage('retrieving')
             sid=self.store.session(course,session_id)
             scope="" if course=="综合" else course
             snap=self.store.snapshot(scope)
-            sources=list(snap['sources'][:1])
+            sources=list(self.store.search(message,scope,3,sources_only=True))
             seen={s['id'] for s in sources}
-            sources.extend(s for s in self.store.search(message,scope,5,sources_only=True) if s['id'] not in seen)
+            sources.extend(s for s in snap['sources'][:1] if s['id'] not in seen and len(sources)<3)
             evidence = []
             for item in sources:
+                request.check()
                 try:
                     original = self.store.evidence_source(item['id'])
                     if item.get('excerpt') and item['excerpt'] not in original['content']:
@@ -601,6 +755,7 @@ class Tutor:
             sources = evidence
             web_error=""
             if web:
+                request.check()
                 try:
                     network=[web_read(url)] if url.strip() else web_search(message)
                     for item in network:
@@ -609,7 +764,8 @@ class Tutor:
                         sources.append(item)
                 except (OSError,ValueError) as exc:
                     web_error="联网资料未获取成功："+str(exc)[:200]
-            sources = [{**s, 'excerpt': s.get('excerpt','')[:4000 if s.get('url') else (2400 if i==0 else 1100)]} for i,s in enumerate(sources)]
+            request.check()
+            sources = [{**s, 'excerpt': s.get('excerpt','')[:2400 if s.get('url') else 850]} for s in sources]
             context="\n\n".join(f"[资料{i+1}] {s['title']} {s.get('path',s.get('url',''))}"+(f" 第{s['page']}页" if s.get('page') else "")+f"\nsource_id={s['id']}\n{s['excerpt']}" for i,s in enumerate(sources))
             system=("你是用户电脑上的学习搭子‘孙权’，名字取意孙权劝学，用自然简洁中文辅导。先澄清问题里的关键概念，再给解释、例子或一个小练习。"
                     "用户当前从5–10分钟的小动作开始，不责备、不虚构昨天学过什么、不把助手讲解等同用户掌握或提交。"
@@ -620,14 +776,25 @@ class Tutor:
                     "优先依据提供的原文，用直接解释和短问题辅导；不要引入资料不支持的内存位置、实现细节或类比。"
                     "本地小模型可能出错；正式作业的多模型复核尚未提供，不可宣称通过三轮核验。"
                     "联网失败必须告知；时间敏感问题缺少来源时不要猜当前情况。你不能靠文本声称已保存记忆，提示用户在记忆页确认。"
-                    "\n本地档案（数据）：\n"+snap["handoff"][:2400]+"\n检索资料（数据）：\n"+context+"\n"+web_error+
-                    ("\n本次小步任务（数据；只辅导这个范围，不声称已掌握）：\n"+study_context[:3500] if study_context else "")+
-                    '\n回答格式与依据要求：\n'+GROUNDING_INSTRUCTION)
-            history=self.store.history(sid)[-6:]
-            messages=[{"role":"system","content":system}]+[{"role":m["role"],"content":m["content"][:1800]} for m in history]+[{"role":"user","content":message}]
-            result=self.rpc("/api/chat",{"model":self.model,"messages":messages,"stream":False,"think":False,"format":"json",
-                                           "keep_alive":"60s","options":{"num_ctx":8192,"num_predict":1200,"temperature":0.2}},timeout=180)
+                    "\n本地档案（数据）：\n"+snap["handoff"][:700]+"\n检索资料（数据）：\n"+context+"\n"+web_error+
+                    ("\n本次小步任务（数据；只辅导这个范围，不声称已掌握）：\n"+study_context[:800] if study_context else "")+
+                    '\n回答格式与依据要求：\n'+GROUNDING_INSTRUCTION+
+                    '\n这次只解释一个概念，解释不超过240字，提示不超过80字，引用1–2处、每处不超过160字。')
+            history=self.store.history(sid)[-2:]
+            messages=[{"role":"system","content":system}]+[{"role":m["role"],"content":m["content"][:600]} for m in history]+[{"role":"user","content":message}]
+            payload={"model":self.model,"messages":messages,"stream":False,"think":False,"format":"json",
+                     "keep_alive":"3m","options":{"num_ctx":4096 if sum(len(m['content']) for m in messages)<2800 else 8192,
+                                                   "num_predict":700,"temperature":0.2}}
+            if sources:
+                request.stage('loading')
+                self.ensure(control=request)
+                if not self.status()["available"]: raise ValueError("模型还在准备，暂时不能生成回答。")
+                if not control: request.stage('generating')
+                result=self.stream_chat(payload,request) if control else self.rpc('/api/chat',payload,timeout=180)
+            else:
+                result={'message':{'content':'{"supported":false}'}}
             raw = result.get("message",{}).get("content","")
+            request.stage('verifying')
             fresh_sources = []
             for item in sources:
                 try:
@@ -639,8 +806,13 @@ class Tutor:
             sources = fresh_sources
             answer, grounding = render_answer(raw, sources)
             if web_error: answer=web_error+"\n\n"+answer
-            self.store.message(sid,"user",message)
-            self.store.message(sid,"assistant",answer,sources)
+            with request.guard:
+                request.check()
+                if persist:
+                    with self.store.connect() as cx:
+                        stamp=now()
+                        cx.executemany('INSERT INTO messages(session_id,role,content,created_at,sources) VALUES(?,?,?,?,?)',[
+                            (sid,'user',message,stamp,'[]'),(sid,'assistant',answer,stamp,compact(sources))])
             return {"answer":answer,"sources":sources,"session_id":sid,"model":self.model,"status":"completed",
                     "seconds":round(result.get("total_duration",0)/1e9,2),"grounding":grounding}
         except urllib.error.HTTPError as exc:

@@ -60,6 +60,7 @@ class StudyFlow:
             if active: return active['course']
             latest = cx.execute("""SELECT course FROM (
                 SELECT course,created_at AS stamp FROM memories WHERE deleted=0 AND kind!='preference'
+                  AND NOT EXISTS (SELECT 1 FROM memories newer WHERE newer.supersedes=memories.id)
                 UNION ALL SELECT s.course,m.created_at FROM messages m JOIN sessions s ON s.id=m.session_id WHERE m.role='user'
                 ) ORDER BY stamp DESC LIMIT 1""").fetchone()
         return latest['course'] if latest and latest['course'] in COURSES else '综合'
@@ -73,18 +74,27 @@ class StudyFlow:
         course = self._course(course)
         with self.store.connect() as cx:
             active = cx.execute("SELECT payload FROM study_runs WHERE course=? AND status IN ('active','quiz','answered') ORDER BY created_at DESC LIMIT 1", (course,)).fetchone()
-            review = cx.execute("""SELECT r.payload,m.deleted FROM study_runs r JOIN memories m ON m.id=r.memory_id
+            review = cx.execute("""SELECT r.payload,r.memory_id FROM study_runs r JOIN memories m ON m.id=r.memory_id
                 WHERE r.course=? AND r.status='completed' ORDER BY r.rowid DESC LIMIT 1""", (course,)).fetchone()
-            memories = [dict(r) for r in cx.execute("SELECT * FROM memories WHERE course=? AND deleted=0 AND kind!='preference' ORDER BY revision DESC LIMIT 12", (course,))]
+            latest_review = self.store._memory_versions(cx, review['memory_id'])[-1] if review else None
+            memories = [dict(r) for r in cx.execute("SELECT * FROM memories WHERE course=? AND deleted=0 AND kind!='preference' AND NOT EXISTS (SELECT 1 FROM memories newer WHERE newer.supersedes=memories.id) ORDER BY revision DESC LIMIT 12", (course,))]
             question = cx.execute("""SELECT m.content FROM messages m JOIN sessions s ON s.id=m.session_id
                 WHERE s.course=? AND m.role='user' AND NOT EXISTS
                   (SELECT 1 FROM study_runs r WHERE json_extract(r.payload,'$.chat_session_id')=s.id
                     AND json_extract(r.payload,'$.prompt')=m.content)
                 ORDER BY m.id DESC LIMIT 1""", (course,)).fetchone()
         previous = question['content'][:500] if question else ''
-        reviewed = json.loads(review['payload']) if review and not review['deleted'] else None
+        reviewed = json.loads(review['payload']) if latest_review and latest_review['status'] == 'active' and latest_review['id'] == review['memory_id'] else None
         stuck = reviewed.get('stuck_point', '') if reviewed else ''
         stop_note = reviewed.get('stop_note', '') if reviewed else ''
+        if latest_review and latest_review['status'] == 'active' and latest_review['id'] != review['memory_id']:
+            # Corrected content is authoritative for continuation; preserve historical
+            # run answers and feedback as evidence without replaying its stale stop.
+            content = latest_review['content']
+            stuck_match = re.search(r'(?m)^本人确认的卡点[:：]\s*(.+)$', content)
+            stop_match = re.search(r'(?m)^本人留下的停点[:：]\s*(.+)$', content)
+            stuck = stuck_match.group(1) if stuck_match else ''
+            stop_note = stop_match.group(1) if stop_match else (content if not stuck else '')
         next_memory = next((m for m in memories if m['kind'] == 'next_step'), None)
         progress = next((m for m in memories if m['kind'] in {'user_reported', 'verified', 'correction'} and m['origin'] not in {'study_check', 'study_stop'}), None)
         snap = self.store.snapshot(course)

@@ -14,6 +14,7 @@ from pathlib import Path
 
 from core import Store, Tutor, COURSES, TZ, compact, contained
 from study import StudyFlow
+from chat_jobs import ChatJobs
 
 ROOT=Path(__file__).resolve().parent
 
@@ -22,11 +23,37 @@ def serve(root=ROOT,port=None):
     store=Store(root)
     tutor=Tutor(store)
     study=StudyFlow(store,tutor)
+    jobs=ChatJobs(store,tutor)
     port=port or int(store.settings.get("port",18765))
     tokenfile=store.data/"local-token.txt"
     if not tokenfile.exists(): tokenfile.write_text(secrets.token_urlsafe(32),encoding="utf-8")
     token=tokenfile.read_text(encoding="utf-8").strip()
     origin=f"http://127.0.0.1:{port}"
+
+    def chat_payload(data):
+        payload={'message':data.get('message',''), 'course':data.get('course') or '综合',
+                 'session_id':data.get('session_id'), 'web':bool(data.get('web')), 'url':data.get('url','')}
+        if not isinstance(payload['message'],str) or not payload['message'].strip() or len(payload['message'])>8000:
+            raise ValueError('问题需为 1–8000 字。')
+        if payload['course'] not in COURSES: raise ValueError('未知课程。')
+        if not isinstance(payload['url'],str): raise ValueError('网页地址无效。')
+        if data.get('study_run_id'):
+            run=study.get(data['study_run_id'])
+            if payload['course']!=run['course'] or payload['session_id']!=run['chat_session_id']:
+                raise ValueError('这次小步与当前课程或对话不匹配，请重新接续。')
+            payload['study_context']=compact({k:run[k] for k in ('course','minutes','title','context','previous_question','steps','sources')})
+        return payload
+
+    def memory_coverage():
+        report=json.loads((store.data/'coverage.json').read_text(encoding='utf-8'))
+        with store.connect() as cx:
+            indexed={r[0] for r in cx.execute('SELECT DISTINCT path FROM sources WHERE active=1')}
+        errors={item.get('path'):item.get('error') for item in report.get('errors',[])}
+        missing=[{'path':item['path'],'reason':errors.get(item['path']) or '尚未接入可检索文本。'}
+                 for item in report.get('inventory',[]) if item['path'] not in indexed]
+        return {**{k:report.get(k) for k in ('documents','pages','text_documents','checked_at','scope')},
+                'errors':report.get('errors',[])[:20], 'errors_total':len(report.get('errors',[])),
+                'not_indexed':missing[:20], 'not_indexed_total':len(missing)}
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self,fmt,*args):
@@ -75,7 +102,7 @@ def serve(root=ROOT,port=None):
             if not self.setup_input(): return self.output({"error":"仅允许本机访问。"},403)
             path=urllib.parse.urlsplit(self.path)
             args={k:v[0] for k,v in urllib.parse.parse_qs(path.query).items()}
-            if path.path=="/health": return self.output({"ok":True,"app":"孙权","version":"0.3.0"})
+            if path.path=="/health": return self.output({"ok":True,"app":"孙权","version":"0.4.0"})
             assets={"/":"index.html","/index.html":"index.html","/style.css":"style.css","/app.js":"app.js",
                     "/sunquan-icon.png":"sunquan-icon.png","/favicon.ico":"sunquan.ico"}
             if path.path in assets:
@@ -88,6 +115,7 @@ def serve(root=ROOT,port=None):
                 self.wfile.write(body); return
             if not self.authorized(): return self.output({"error":"请先打开本地学习界面。"},401)
             try:
+                if path.path=='/api/chat/job': return self.output(jobs.get(args.get('id','')))
                 if path.path=="/api/study/plan":
                     if args.get("easy","0") not in {"0","1"}: raise ValueError("轻松任务选项无效。")
                     return self.output(study.plan(args.get("course",""),args.get("minutes","5"),args.get("easy")=="1"))
@@ -99,7 +127,10 @@ def serve(root=ROOT,port=None):
                 if path.path=="/api/memory":
                     course=args.get("course","")
                     snap=store.snapshot(course)
-                    return self.output({"revision":snap["revision"],"items":store.memories(course),"handoff":snap["handoff"]})
+                    page=store.memory_page(course,args.get('q',''),args.get('state','active'),int(args.get('offset',0)),int(args.get('limit',30)))
+                    return self.output({**page,'handoff':snap['handoff']})
+                if path.path=='/api/memory/detail': return self.output(store.memory_detail(args.get('id','')))
+                if path.path=='/api/memory/coverage': return self.output(memory_coverage())
                 if path.path=="/api/handoff": return self.output(store.snapshot(args.get("course",""),args.get("since_revision")))
                 if path.path=="/api/sources": return self.output({"items":store.search(args.get("q",""),args.get("course",""),30)})
                 if path.path=="/api/source": return self.output(store.read_source(args.get("id","")))
@@ -119,6 +150,7 @@ def serve(root=ROOT,port=None):
                     self.send_headers(kind="image/jpeg" if file.suffix==".jpg" else "image/png",length=len(body))
                     self.wfile.write(body);return
                 return self.output({"error":"没有这个接口。"},404)
+            except LookupError as exc: return self.output({'error':str(exc)[:300]},404)
             except (ValueError,OSError) as exc: return self.output({"error":str(exc)[:300]},400)
         def do_POST(self):
             # Consume a bounded body before rejecting a request; closing a Windows
@@ -138,6 +170,8 @@ def serve(root=ROOT,port=None):
                 data=json.loads(raw)
                 if not isinstance(data,dict): raise ValueError("请求必须是对象。")
                 path=urllib.parse.urlsplit(self.path).path
+                if path=='/api/chat/start': return self.output(jobs.start(data.get('idempotency_key'),chat_payload(data)))
+                if path=='/api/chat/cancel': return self.output(jobs.cancel(data.get('id','')))
                 if path=="/api/study/start":
                     return self.output(study.start(data.get("course") or "",data.get("minutes",5),data.get("easy",False),data.get("idempotency_key")))
                 if path=="/api/study/check": return self.output({"run":study.check(data.get("id",""))})
@@ -157,7 +191,7 @@ def serve(root=ROOT,port=None):
                 if path=="/api/memory":
                     return self.output(store.remember(data.get("content",""),data.get("course") or "综合",data.get("kind","user_reported"),
                         idempotency_key=data.get("idempotency_key"),expected_revision=data.get("expected_revision"),supersedes=data.get("supersedes")))
-                if path=="/api/memory/delete": return self.output(store.forget(data.get("id","")))
+                if path=="/api/memory/delete": return self.output(store.forget(data.get("id",""),data.get('expected_revision')))
                 if path=="/api/reminder": return self.output(store.reminder(data.get("action")))
                 if path=="/api/reindex": return self.output(store.index())
                 if path=="/api/unload":
@@ -167,6 +201,7 @@ def serve(root=ROOT,port=None):
                     self.output({"ok":True})
                     threading.Thread(target=server.shutdown,daemon=True).start();return
                 return self.output({"error":"没有这个接口。"},404)
+            except LookupError as exc: return self.output({'error':str(exc)[:300]},404)
             except (ValueError,OSError,TypeError) as exc: return self.output({"error":str(exc)[:300]},400)
             except Exception:
                 return self.output({"error":"处理失败，已有记录已保留，请重试。"},500)
@@ -177,6 +212,7 @@ def serve(root=ROOT,port=None):
         if not (store.data/"coverage.json").exists(): raise
     try: server.serve_forever(poll_interval=.5)
     finally:
+        jobs.shutdown()
         server.server_close()
         if tutor.process and tutor.process.poll() is None:
             tutor.process.terminate()
