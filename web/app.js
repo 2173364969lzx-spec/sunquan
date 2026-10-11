@@ -3,6 +3,8 @@ const $ = id => document.getElementById(id);
 let activeView = 'today', course = '', state = null, busy = false;
 let memoryRequest = 0, sourceRequest = 0, historyRequest = 0;
 let memoryRevision = null, correction = null, sourceDetailRequest = 0;
+let plan = null, studyRun = null, planRequest = 0, studyBusy = false, detached = false, minutes = 5, easy = false;
+try { course = localStorage.getItem('study-course') || ''; } catch (_) {}
 const sessions = new Map();
 try { Object.entries(JSON.parse(localStorage.getItem('study-sessions') || '{}')).forEach(([k,v]) => sessions.set(k,v)); } catch (_) {}
 const el = (tag, cls, content) => { const n = document.createElement(tag); if (cls) n.className = cls; if (content !== undefined) n.textContent = content; return n; };
@@ -73,7 +75,6 @@ function showView(view, focus = false) {
   if (focus) $('main').focus({preventScroll:true});
 }
 function renderReminder(reminder = {}) {
-  $('reminder-body').textContent = '点击“现在开始”，把这一步拆成一个小问题。';
   let message = '';
   if (['snoozed','snooze'].includes(reminder.status)) message = reminder.snoozed_until ? '稍后再继续 · ' + localDate(reminder.snoozed_until) : '已安排稍后提醒。';
   else if (['skipped','skip','dismissed'].includes(reminder.status)) message = '今天好好休息，想继续时随时回来。';
@@ -84,7 +85,7 @@ async function loadState() {
   try {
     state = await api('/api/state');
     $('date').textContent = state.date || new Date().toLocaleDateString('zh-CN',{month:'long',day:'numeric',weekday:'long'});
-    $('next-step').textContent = state.snapshot?.next_step || '先花5分钟，查看一条课程通知。';
+    if (!plan) $('next-step').textContent = state.snapshot?.next_step || '先花5分钟，查看一条课程通知。';
     $('summary').textContent = state.snapshot?.summary || '还没有学习记录。先问一个课程问题，或在记忆里记下你目前学到哪儿。';
     $('document-count').textContent = state.stats?.documents ?? 0;
     $('model-status').textContent = state.model?.available ? '本地模型已就绪' : '本地模型暂未就绪';
@@ -165,7 +166,7 @@ function message(role, content, sources = [], error = false) {
 function resetChat() { empty($('chat'),'从一个具体问题开始','例如：“这份课程通知里，我这周要做什么？” 回答是学习参考，实际进度由你在记忆中记录。'); $('chat').firstChild.id = 'chat-empty'; }
 async function loadHistory() {
   if (busy) return;
-  const request = ++historyRequest, selected = course, session = sessions.get(selected);
+  const request = ++historyRequest, selected = course, session = studyRun?.chat_session_id || sessions.get(selected);
   if (!session) { resetChat(); return; }
   $('chat').replaceChildren(el('p','loading','正在读取这门课程的对话…'));
   try { const data = await api(query('/api/history',{session_id:session})); if (request !== historyRequest || selected !== course || busy) return; resetChat(); (data.items || []).forEach(item => message(item.role,item.content,item.sources || [])); }
@@ -173,30 +174,38 @@ async function loadHistory() {
 }
 document.querySelectorAll('[data-view]').forEach(button=>button.addEventListener('click',()=>showView(button.dataset.view,true)));
 document.querySelector('.brand').addEventListener('click',event=>{event.preventDefault();showView('today',true);});
-$('course').addEventListener('change',()=>{course=$('course').value;if(correction)cancelCorrection();notice('');if(activeView==='learn')loadHistory();else if(activeView==='memory')loadMemory();else if(activeView==='sources')loadSources();});
-['start','snooze','skip'].forEach(action=>$ (action).addEventListener('click',async()=>{
+$('course').addEventListener('change',()=>{
+  course=$('course').value; try { localStorage.setItem('study-course',course); } catch (_) {}
+  studyRun=null; plan=null; detached=false; ++historyRequest; ++memoryRequest; ++sourceRequest;
+  renderRun(); if(correction)cancelCorrection(); notice(''); loadPlan();
+  if(activeView==='learn')loadHistory();else if(activeView==='memory')loadMemory();else if(activeView==='sources')loadSources();
+});
+['snooze','skip'].forEach(action=>$(action).addEventListener('click',async()=>{
   const button=$(action);button.disabled=true;
-  try { const result=await api('/api/reminder',{action}); renderReminder(result.reminder || result);notice(action==='start'?'准备好了，按发送后才会开始提问。':action==='snooze'?'已延后15分钟。':'已记下今天休息。');if(action==='start'){showView('learn');$('question').value='带我完成今天这个5分钟的小任务。';$('question').focus();} }
+  try { const result=await api('/api/reminder',{action}); renderReminder(result.reminder || result);notice(action==='snooze'?'已延后15分钟。':'已记下今天休息。'); }
   catch(error){notice(error.message,true);}finally{button.disabled=false;}
 }));
 $('web').addEventListener('change',()=>{$('url-row').hidden=!$('web').checked;});
 $('question').addEventListener('keydown',event=>{if(event.key==='Enter'&&(event.ctrlKey||event.metaKey)){event.preventDefault();$('chat-form').requestSubmit();}});
-$('chat-form').addEventListener('submit',async event=>{
-  event.preventDefault();const question=$('question').value.trim();if(!question||busy)return;
-  const selected=course, web=$('web').checked, url=$('url').value.trim();
+$('chat-form').addEventListener('submit',event=>{event.preventDefault();sendQuestion($('question').value.trim());});
+async function sendQuestion(question, automatic=false) {
+  if(!question||busy||studyBusy)return;
+  const selected=studyRun?.course || course, run=studyRun, web=automatic?false:$('web').checked, url=$('url').value.trim();
   if(web&&url){try{const parsed=new URL(url);if(parsed.protocol!=='https:')throw new Error();}catch(_){notice('请输入公开的 https 网页地址。',true);return;}}
-  busy=true;++historyRequest;$('send').disabled=true;$('new-chat').disabled=true;$('course').disabled=true;$('question').value='';notice('');message('user',question);
+  busy=true; ++historyRequest; updateLocks(); $('question').value='';notice('');message('user',question);
   $('chat-status').textContent='本地模型正在处理，首次加载可能需要几分钟…';
   const waiting=message('assistant','正在读取资料并等待本地模型回答…');waiting.setAttribute('aria-busy','true');
   try {
-    const result=await api('/api/chat',{message:question,course:selected,session_id:sessions.get(selected),web,...(web&&url?{url}:{})},200000);waiting.remove();
-    if(result.session_id){sessions.set(selected,result.session_id);saveSessions();}
-    if(result.error || !result.answer || ['error','unavailable','offline','failed'].includes(result.status)){message('assistant',result.error || '本地模型暂时无法回答，请启动 Ollama 并确认模型可用后重试。',[],true);$('question').value=question;$('chat-status').textContent='这次提问未完成；你的问题已放回输入框。';}
-    else {message('assistant',result.answer,result.sources || []);$('chat-status').textContent='回答已生成。实际学习进度可在“记忆”中记录。';}
-  }catch(error){waiting.remove();message('assistant',error.message,[],true);$('question').value=question;$('chat-status').textContent='这次提问未完成；你的问题已放回输入框。';}
-  finally{busy=false;$('send').disabled=false;$('new-chat').disabled=false;$('course').disabled=false;loadState();}
+    const result=await api('/api/chat',{message:question,course:selected,session_id:run?.chat_session_id || sessions.get(selected),web,...(run?{study_run_id:run.id}:{}),...(web&&url?{url}:{})},220000);waiting.remove();
+    if(result.session_id){sessions.set(selected,result.session_id);saveSessions();if(run)run.chat_session_id=result.session_id;}
+    if(result.error || !result.answer || ['error','unavailable','offline','failed'].includes(result.status)){message('assistant',result.error || '本地模型暂时无法回答，你可以先阅读上面的资料，再用自己的话回答。',[],true);$('question').value=question;$('chat-status').textContent='这次提问未完成；原问题已保留，可以重试。';}
+    else {message('assistant',result.answer,result.sources || []);$('chat-status').textContent='回答供学习参考。准备好后，可以试着回答几个小问题。';}
+  }catch(error){waiting.remove();message('assistant',error.message,[],true);$('question').value=question;$('chat-status').textContent='这次提问未完成；原问题已保留，可以重试。';}
+  finally{busy=false;updateLocks();loadState();}
+}
+$('new-chat').addEventListener('click',()=>{
+  if(busy||studyBusy)return; detached=true;studyRun=null;renderRun();sessions.delete(course);saveSessions();++historyRequest;resetChat();$('question').value='';$('chat-status').textContent='新对话已准备好。今日的小步仍可继续。';$('question').focus();
 });
-$('new-chat').addEventListener('click',()=>{if(busy)return;sessions.delete(course);saveSessions();++historyRequest;resetChat();$('question').value='';$('chat-status').textContent='新对话已准备好。';$('question').focus();});
 $('memory-form').addEventListener('submit',async event=>{
   event.preventDefault();const content=$('memory-content').value.trim();if(!content)return;$('save-memory').disabled=true;
   const editing=correction, selected=course;
@@ -211,4 +220,113 @@ $('reindex').addEventListener('click',async()=>{
 });
 $('close-source').addEventListener('click',()=>$('source-dialog').close());
 $('source-dialog').addEventListener('click',event=>{if(event.target===$('source-dialog')){const rect=$('source-dialog').getBoundingClientRect();if(event.clientX<rect.left||event.clientX>rect.right||event.clientY<rect.top||event.clientY>rect.bottom)$('source-dialog').close();}});
-loadState();
+function updateLocks() {
+  const locked=busy||studyBusy;
+  ['course','send','new-chat','easy','plan-retry'].forEach(id=>$(id).disabled=locked);
+  $('start').disabled=locked||!plan;
+  document.querySelectorAll('[name="minutes"]').forEach(n=>n.disabled=locked);
+  $('study-panel').querySelectorAll('button,textarea').forEach(n=>n.disabled=locked);
+}
+function draftFor(id) { try{return JSON.parse(localStorage.getItem('study-draft:'+id)||'{}');}catch(_){return {};} }
+function saveDraft(id,value) { try{localStorage.setItem('study-draft:'+id,JSON.stringify(value));}catch(_){} }
+function renderPlan() {
+  if(!plan)return;
+  $('next-step').textContent=plan.title || plan.next_step || '从一小步开始';
+  $('reminder-body').textContent=plan.nudge || '先看一段资料，用自己的话说说你理解了什么。';
+  $('plan-context').textContent=[plan.course,plan.context_label,studyRun&&studyRun.status!=='completed'?'已有未结束的小步：'+studyRun.minutes+'分钟，点击继续会恢复它。':'开始后会带上相关资料和停点。'].filter(Boolean).join(' · ');
+  $('start').textContent=studyRun&&studyRun.status!=='completed'?'继续这次小步 ↗':'开始这次小步 ↗';
+}
+async function loadPlan() {
+  const request=++planRequest,selected=course;
+  $('plan-retry').hidden=true;$('start').disabled=true;
+  try {
+    const result=await api(query('/api/study/plan',{course:selected,minutes,easy:easy?'1':'0'}));
+    if(request!==planRequest||selected!==course)return;
+    plan=result.plan;
+    if(!detached)studyRun=result.run || null;
+    renderPlan();renderRun();if(activeView==='learn')loadHistory();
+  }catch(error){if(request===planRequest&&selected===course){plan=null;notice(error.message,true);$('plan-retry').hidden=false;}}
+  finally{if(request===planRequest)updateLocks();}
+}
+async function startStudy() {
+  if(busy||studyBusy||!plan)return;
+  studyBusy=true;updateLocks();const selected=course;
+  let result;
+  try {
+    result=await api('/api/study/start',{course:plan.course || course,minutes,easy,idempotency_key:key()});
+    if(selected!==course)return;
+    studyRun=result.run;detached=false;
+    if(studyRun.chat_session_id){sessions.set(studyRun.course,studyRun.chat_session_id);saveSessions();}
+    renderPlan();renderRun();showView('learn',true);
+  }catch(error){notice(error.message,true);}
+  finally{studyBusy=false;updateLocks();}
+  if(!result?.run)return;
+  if(result.resumed){await loadHistory();notice('已接回这次小步，按原来的计划继续。');}
+  else if(state?.model?.available){await loadHistory();await sendQuestion(studyRun.prompt,true);}
+  else{$('question').value=studyRun.prompt || ''; $('chat-status').textContent='本地模型暂未就绪。可以先阅读上面的原文，完成后做个小检查；原问题已保留。';}
+}
+function runButton(label,action,cls='secondary') {const b=el('button',cls,label);b.type='button';b.addEventListener('click',action);return b;}
+function renderRun() {
+  const panel=$('study-panel'),run=studyRun;panel.replaceChildren();panel.hidden=!run;
+  if(!run)return;
+  panel.append(el('div','eyebrow',run.course+' · 计划 '+run.minutes+' 分钟'),el('h2','',run.title || '这次的小步'));
+  if(run.context){const detail=el('details','study-excerpt');detail.append(el('summary','',run.context_label || '读回上次的线索'),el('p','study-context',run.context));panel.append(detail);}
+  if(run.previous_question)panel.append(el('p','study-context','上次的问题：'+run.previous_question));
+  if(run.steps?.length){const list=el('ol','study-steps');run.steps.forEach(step=>list.append(el('li','',step)));panel.append(list);}
+  if(run.sources?.length){panel.append(el('h3','','这次用到的资料'),sourceChips(run.sources));run.sources.forEach(source=>{if(source.excerpt){const details=el('details','study-excerpt');details.append(el('summary','',source.title || '资料摘录'),el('p','',source.excerpt));panel.append(details);}});}
+  else panel.append(el('p','hint','这一步暂时没有匹配的资料。可以先整理问题，或到“资料”查找依据。'));
+  const progress=el('div','study-progress');panel.append(progress);
+  if(run.status==='active'){
+    progress.append(el('p','hint','看完这一小步后，用几个小问题检查自己的理解。'),runButton('试试几个小问题',()=>studyAction('/api/study/check',{id:run.id},'正在准备小问题，本地模型可能需要几分钟…')));
+  }else if(run.status==='quiz'&&!run.answers){
+    const form=el('form','quiz-form'),draft=draftFor(run.id);
+    form.append(el('h3','','用自己的话回答'),el('p','hint',run.quiz?.note || '想不起来也可以如实写下，先留下你现在的理解。'));
+    (run.quiz?.questions || []).forEach(q=>{const label=el('label','quiz-question',q.question),input=el('textarea');input.rows=3;input.maxLength=2000;input.required=true;input.dataset.questionId=q.id;input.value=draft.answers?.[q.id] || '';label.append(input);form.append(label);input.addEventListener('input',()=>{const current=draftFor(run.id);current.answers={...current.answers,[q.id]:input.value};saveDraft(run.id,current);});});
+    const submit=el('button','primary','保存原回答并查看参考反馈');submit.type='submit';form.append(submit);
+    form.addEventListener('submit',event=>{event.preventDefault();const answers=[...form.querySelectorAll('textarea')].map(n=>({id:n.dataset.questionId,answer:n.value}));if(!answers.length)return;
+      const current=draftFor(run.id),signature=JSON.stringify(answers);if(current.signature!==signature){current.signature=signature;current.answerKey=key();saveDraft(run.id,current);}
+      studyAction('/api/study/answer',{id:run.id,answers,idempotency_key:current.answerKey},'正在保存原回答并准备参考反馈…');});progress.append(form);
+  }
+  if(run.answers){
+    progress.append(el('h3','','你保存的原回答'));
+    const answers=Array.isArray(run.answers)?run.answers:run.answers.answers || [];
+    answers.forEach(answer=>{const item=el('article','saved-answer'),q=run.quiz?.questions?.find(q=>q.id===answer.id);item.append(el('h4','',q?.question || answer.id),el('p','',answer.answer));progress.append(item);});
+    progress.append(el('h3','','AI 参考反馈'),el('p','hint','这是对本次回答的参考意见，是否卡住由你自己确认。'));
+    if(run.feedback?.status==='ready'){
+      (run.feedback.items || []).forEach(item=>{const q=run.quiz?.questions?.find(q=>q.id===item.id);const card=el('article','feedback-item');if(q)card.append(el('h4','',q.question));card.append(markdownText(item.comment || ''));if(item.evidence_quote)card.append(el('blockquote','feedback-evidence','原文依据：'+item.evidence_quote));const source=run.sources?.find(s=>s.id===item.source_id);if(source)card.append(sourceChips([source]));progress.append(card);});if(run.feedback.summary)progress.append(markdownText(run.feedback.summary));
+    }else progress.append(el('p','hint','原回答已保存，参考反馈暂时不可用。可以重试，也可以直接确认这次的卡点。'),runButton('重试参考反馈',()=>studyAction('/api/study/feedback',{id:run.id},'正在重新准备参考反馈…')));
+    if(run.status!=='completed'){
+      const form=el('form','finish-form'),label=el('label','','这次还有哪里卡住？（可选）'),input=el('textarea'),draft=draftFor(run.id);input.rows=2;input.maxLength=1000;input.placeholder='写下你确认的卡点；留空表示这次没有要记录的卡点。';input.value=draft.stuck || '';label.append(input);form.append(label,el('p','hint','保存本次原回答和你确认的卡点，供下次接着学。'));
+      input.addEventListener('input',()=>{const current=draftFor(run.id);current.stuck=input.value;saveDraft(run.id,current);});const submit=el('button','primary','确认并保存这次作答');submit.type='submit';form.append(submit);form.addEventListener('submit',event=>{event.preventDefault();studyAction('/api/study/finish',{id:run.id,stuck_point:input.value},'正在保存你确认的记录…');});progress.append(form);
+    }
+  }
+  if(run.status==='completed'){
+    progress.append(el('p','completion','这次作答和你确认的卡点已保存。'),el('p','hint',run.stuck_point?'你确认的卡点：'+run.stuck_point:'你确认这次没有要记录的卡点。'),runButton('再来一个小步',async()=>{studyRun=null;detached=false;renderRun();showView('today',true);await loadPlan();}));
+  }
+  updateLocks();
+}
+async function studyAction(path,body,label) {
+  if(busy||studyBusy)return;
+  const id=studyRun?.id,selected=course;if(!id)return;
+  studyBusy=true;updateLocks();notice(label);
+  try{
+    const result=await api(path,body,220000);if(selected!==course||studyRun?.id!==id)return;
+    studyRun=result.run;renderRun();notice(path.endsWith('/finish')?'这次作答已保存，下次可以接着这里继续。':'');
+    if(path.endsWith('/finish')){try{localStorage.removeItem('study-draft:'+id);}catch(_){} await loadState();detached=true;await loadPlan();detached=false;}
+  }catch(error){
+    notice(error.message+' 可以重试，已保存的回答会保留。',true);
+    try{const result=await api(query('/api/study/run',{id}));if(selected===course&&studyRun?.id===id){studyRun=result.run;renderRun();}}catch(_){}
+  }finally{studyBusy=false;updateLocks();}
+}
+$('start').addEventListener('click',startStudy);
+$('plan-retry').addEventListener('click',loadPlan);
+$('easy').addEventListener('click',()=>{easy=true;minutes=5;document.querySelectorAll('[name="minutes"]').forEach(n=>n.checked=n.value==='5');loadPlan();});
+document.querySelectorAll('[name="minutes"]').forEach(n=>n.addEventListener('change',()=>{minutes=Number(n.value);easy=false;loadPlan();}));
+async function initialize() {
+  const launch=new URLSearchParams(location.search), requested=launch.get('study');
+  if(['5','30'].includes(requested)){minutes=Number(requested);easy=launch.get('easy')==='1';if(easy)minutes=5;}
+  document.querySelectorAll('[name="minutes"]').forEach(n=>n.checked=Number(n.value)===minutes);
+  await loadState();if(!state)return;await loadPlan();
+  if(['5','30'].includes(requested)&&plan){history.replaceState(null,'',location.pathname+location.hash);await startStudy();}
+}
+initialize();

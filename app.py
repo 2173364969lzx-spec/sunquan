@@ -13,6 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from core import Store, Tutor, COURSES, TZ, compact, contained
+from study import StudyFlow
 
 ROOT=Path(__file__).resolve().parent
 
@@ -20,6 +21,7 @@ ROOT=Path(__file__).resolve().parent
 def serve(root=ROOT,port=None):
     store=Store(root)
     tutor=Tutor(store)
+    study=StudyFlow(store,tutor)
     port=port or int(store.settings.get("port",18765))
     tokenfile=store.data/"local-token.txt"
     if not tokenfile.exists(): tokenfile.write_text(secrets.token_urlsafe(32),encoding="utf-8")
@@ -73,7 +75,7 @@ def serve(root=ROOT,port=None):
             if not self.setup_input(): return self.output({"error":"仅允许本机访问。"},403)
             path=urllib.parse.urlsplit(self.path)
             args={k:v[0] for k,v in urllib.parse.parse_qs(path.query).items()}
-            if path.path=="/health": return self.output({"ok":True,"app":"孙权","version":"0.1.0"})
+            if path.path=="/health": return self.output({"ok":True,"app":"孙权","version":"0.2.0"})
             assets={"/":"index.html","/index.html":"index.html","/style.css":"style.css","/app.js":"app.js",
                     "/sunquan-icon.png":"sunquan-icon.png","/favicon.ico":"sunquan.ico"}
             if path.path in assets:
@@ -86,6 +88,10 @@ def serve(root=ROOT,port=None):
                 self.wfile.write(body); return
             if not self.authorized(): return self.output({"error":"请先打开本地学习界面。"},401)
             try:
+                if path.path=="/api/study/plan":
+                    if args.get("easy","0") not in {"0","1"}: raise ValueError("轻松任务选项无效。")
+                    return self.output(study.plan(args.get("course",""),args.get("minutes","5"),args.get("easy")=="1"))
+                if path.path=="/api/study/run": return self.output({"run":study.get(args.get("id",""))})
                 if path.path=="/api/state":
                     return self.output({"app":"孙权","date":datetime.now(TZ).strftime("%Y年%m月%d日"),
                                         "model":tutor.status(),"courses":[{"id":c,"title":c} for c in COURSES],
@@ -132,7 +138,19 @@ def serve(root=ROOT,port=None):
                 data=json.loads(raw)
                 if not isinstance(data,dict): raise ValueError("请求必须是对象。")
                 path=urllib.parse.urlsplit(self.path).path
+                if path=="/api/study/start":
+                    return self.output(study.start(data.get("course") or "",data.get("minutes",5),data.get("easy",False),data.get("idempotency_key")))
+                if path=="/api/study/check": return self.output({"run":study.check(data.get("id",""))})
+                if path=="/api/study/answer": return self.output({"run":study.answer(data.get("id",""),data.get("answers"),data.get("idempotency_key"))})
+                if path=="/api/study/feedback": return self.output({"run":study.feedback(data.get("id",""))})
+                if path=="/api/study/finish": return self.output({"run":study.finish(data.get("id",""),data.get("stuck_point",""))})
                 if path=="/api/chat":
+                    if data.get("study_run_id"):
+                        run=study.get(data["study_run_id"])
+                        if (data.get("course") or "综合")!=run['course'] or data.get("session_id")!=run['chat_session_id']:
+                            raise ValueError("这次小步与当前课程或对话不匹配，请重新接续。")
+                        context=compact({k:run[k] for k in ('course','minutes','title','context','previous_question','steps','sources')})
+                        return self.output(tutor.answer(data.get("message",""),run['course'],run['chat_session_id'],bool(data.get("web")),data.get("url",""),study_context=context))
                     return self.output(tutor.answer(data.get("message",""),data.get("course") or "综合",data.get("session_id"),bool(data.get("web")),data.get("url","")))
                 if path=="/api/memory":
                     return self.output(store.remember(data.get("content",""),data.get("course") or "综合",data.get("kind","user_reported"),

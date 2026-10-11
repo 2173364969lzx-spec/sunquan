@@ -637,6 +637,44 @@ class HTTPTests(Fixture):
         self.assertIn("SameSite=Strict", headers["Set-Cookie"])
         self.assertEqual(self.request("GET", "/api/state", headers={"Cookie": self.cookie})[0], 200)
 
+    def test_study_http_offline_roundtrip_and_idempotent_confirmation(self):
+        self.assertEqual(self.request('GET', '/api/study/plan')[0], 401)
+        payload = {'course':'Java','minutes':5,'easy':False,'idempotency_key':'http-start'}
+        self.assertEqual(self.request('POST', '/api/study/start', payload)[0], 403)
+        status, _, raw = self.request('POST', '/api/study/start', payload, self.write_headers())
+        self.assertEqual(status, 200)
+        run = json.loads(raw)['run']
+        self.assertEqual(self.store.memories(), [])
+        status, _, raw = self.request('POST', '/api/study/check', {'id':run['id']}, self.write_headers())
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(raw)['run']['quiz']['mode'], 'reflection')
+        status, _, raw = self.request('POST', '/api/study/answer',
+            {'id':run['id'],'answers':[{'id':'q1','answer':'  原答\n保留空格  '}],'idempotency_key':'http-answer'}, self.write_headers())
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(raw)['run']['feedback']['status'], 'unavailable')
+        self.assertEqual(self.store.memories(), [])
+        for _ in range(2):
+            status, _, raw = self.request('POST', '/api/study/finish', {'id':run['id'],'stuck_point':'还不清楚泛型'}, self.write_headers())
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(raw)['run']['status'], 'completed')
+        self.assertEqual(len(self.store.memories()), 1)
+        self.assertIn('  原答\n保留空格  ', self.store.memories()[0]['content'])
+        status, _, raw = self.request('GET', '/api/study/plan?course=Java&minutes=30', headers={'Cookie':self.cookie})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(raw)['plan']['next_step'], '还不清楚泛型')
+
+    def test_study_chat_rejects_mismatched_course_and_session(self):
+        status, _, raw = self.request('POST', '/api/study/start',
+            {'course':'Java','minutes':30,'idempotency_key':'course-start'}, self.write_headers())
+        self.assertEqual(status, 200)
+        run = json.loads(raw)['run']
+        for course, session in [('离散数学',run['chat_session_id']),('Java','different-session')]:
+            status, _, raw = self.request('POST', '/api/chat',
+                {'message':'继续','course':course,'session_id':session,'study_run_id':run['id']}, self.write_headers())
+            self.assertEqual(status, 400)
+            self.assertIn('不匹配', json.loads(raw)['error'])
+        self.assertEqual(self.store.history(run['chat_session_id']), [])
+
     def test_wrong_host_is_rejected_even_with_cookie(self):
         for method, path, data in [("GET", "/api/state", None), ("POST", "/api/memory", {"content":"拒绝", "course":"Java"})]:
             headers = self.write_headers()

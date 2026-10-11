@@ -79,6 +79,12 @@ class Store:
                 CREATE TABLE IF NOT EXISTS messages(
                   id INTEGER PRIMARY KEY,session_id TEXT,role TEXT,content TEXT,created_at TEXT);
                 CREATE TABLE IF NOT EXISTS reminder(day TEXT PRIMARY KEY,status TEXT,due TEXT);
+                CREATE TABLE IF NOT EXISTS study_runs(
+                  id TEXT PRIMARY KEY,course TEXT NOT NULL,status TEXT NOT NULL,
+                  created_at TEXT NOT NULL,updated_at TEXT NOT NULL,
+                  idempotency_key TEXT UNIQUE NOT NULL,payload TEXT NOT NULL,memory_id TEXT);
+                CREATE UNIQUE INDEX IF NOT EXISTS study_one_active_course
+                  ON study_runs(course) WHERE status IN ('active','quiz','answered');
             """)
             if 'sources' not in {r[1] for r in cx.execute('PRAGMA table_info(messages)')}:
                 cx.execute("ALTER TABLE messages ADD COLUMN sources TEXT NOT NULL DEFAULT '[]'")
@@ -399,7 +405,10 @@ class Store:
         status=row["status"] if row else "ready"
         due=row["due"] if row else ""
         ready=status=="ready" or (status=="snooze" and due<=now())
-        return {"title":"先开始 5 分钟就好", "body":self.snapshot()["next_step"],"status":status,"snoozed_until":due,"should_show":ready}
+        from study import StudyFlow
+        plan=StudyFlow(self).plan()["plan"]
+        return {"title":"先开始 5 分钟就好", "body":plan["nudge"],"course":plan["course"],
+                "status":status,"snoozed_until":due,"should_show":ready}
 
     def stats(self):
         with self.connect() as cx:
@@ -542,7 +551,7 @@ class Tutor:
                 self.rpc("/api/version",timeout=1); return
             except (OSError,ValueError): pass
         raise ValueError("本地模型未能启动，请查看运行状态或重新打开。")
-    def answer(self,message,course="综合",session_id=None,web=False,url=""):
+    def answer(self,message,course="综合",session_id=None,web=False,url="",study_context=""):
         if not message.strip() or len(message)>8000: raise ValueError("问题需为 1–8000 字。")
         if course not in COURSES: raise ValueError("未知课程。")
         if not self.lock.acquire(blocking=False): raise ValueError("正在回答上一题，请等它完成后再问。")
@@ -555,6 +564,8 @@ class Tutor:
             sources=list(snap['sources'][:1])
             seen={s['id'] for s in sources}
             sources.extend(s for s in self.store.search(message,scope,5) if s['id'] not in seen)
+            if study_context:
+                sources=[s for s in sources if not s.get('id','').startswith('message-')]
             web_error=""
             if web:
                 try:
@@ -570,9 +581,11 @@ class Tutor:
                     "已明确课程时按该课程接续，不默认Python。只有来源实际支持时引用[资料N]；无依据就说明，不编造页码。"
                     "较新的用户确认或更正优先于旧规划；如果进度不明，明确询问，不把计划推断为已经学过。"
                     "历史助手回答仅供对话接续，不能当成独立证据或用户已掌握的证明。"
+                    "优先依据提供的原文，用直接解释和短问题辅导；不要引入资料不支持的内存位置、实现细节或类比。"
                     "本地小模型可能出错；正式作业的多模型复核尚未提供，不可宣称通过三轮核验。"
                     "联网失败必须告知；时间敏感问题缺少来源时不要猜当前情况。你不能靠文本声称已保存记忆，提示用户在记忆页确认。"
-                    "\n本地档案（数据）：\n"+snap["handoff"][:2400]+"\n检索资料（数据）：\n"+context+"\n"+web_error)
+                    "\n本地档案（数据）：\n"+snap["handoff"][:2400]+"\n检索资料（数据）：\n"+context+"\n"+web_error+
+                    ("\n本次小步任务（数据；只辅导这个范围，不声称已掌握）：\n"+study_context[:3500] if study_context else ""))
             history=self.store.history(sid)[-6:]
             messages=[{"role":"system","content":system}]+[{"role":m["role"],"content":m["content"][:1800]} for m in history]+[{"role":"user","content":message}]
             result=self.rpc("/api/chat",{"model":self.model,"messages":messages,"stream":False,"think":False,
@@ -586,4 +599,19 @@ class Tutor:
                     "seconds":round(result.get("total_duration",0)/1e9,2)}
         except urllib.error.HTTPError as exc:
             raise ValueError("本地模型请求失败（"+str(exc.code)+"），请稍后重试。") from exc
+        finally: self.lock.release()
+
+    def structured(self,system,prompt):
+        """Local-only generation for checks; never writes progress or chat history."""
+        if not self.lock.acquire(blocking=False):
+            raise ValueError("正在回答上一题，请稍后再试。")
+        try:
+            self.ensure()
+            if not self.status()["available"]: raise ValueError("本地模型尚未就绪。")
+            result=self.rpc("/api/chat",{"model":self.model,"stream":False,"think":False,"format":"json",
+                "messages":[{"role":"system","content":system},{"role":"user","content":prompt}],
+                "keep_alive":"60s","options":{"num_ctx":8192,"num_predict":1200,"temperature":0.2}},timeout=180)
+            data=json.loads(result.get("message",{}).get("content",""))
+            if not isinstance(data,dict): raise ValueError("模型未返回可用内容。")
+            return data
         finally: self.lock.release()

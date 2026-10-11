@@ -27,7 +27,7 @@ $auth=@{Authorization=('Bearer '+(Get-Content -LiteralPath (Join-Path $appRoot '
 function Send-Action([string]$action) {
     Invoke-RestMethod -Uri ($base+'/api/reminder') -Method Post -Headers $auth -ContentType 'application/json' -Body (@{action=$action}|ConvertTo-Json -Compress) -TimeoutSec 4 | Out-Null
 }
-function Open-Study { Start-Process $base }
+function Open-Study([string]$query='') { Start-Process ($base+$query) }
 $icon=[System.Windows.Forms.NotifyIcon]::new()
 $appIconPath=Join-Path $appRoot 'web/sunquan.ico'
 $appIcon=[System.Drawing.Icon]::new($appIconPath)
@@ -51,19 +51,21 @@ $script:reminderForm=$null
 function Show-StudyReminder([string]$body) {
     if ($script:reminderForm -and -not $script:reminderForm.IsDisposed) { return }
     $form=[System.Windows.Forms.Form]::new();$script:reminderForm=$form
-    $form.Text='孙权';$form.Icon=$appIcon;$form.Size=[System.Drawing.Size]::new(490,260)
+    $form.Text='孙权';$form.Icon=$appIcon;$form.Size=[System.Drawing.Size]::new(510,305)
     $form.StartPosition='CenterScreen';$form.FormBorderStyle='FixedDialog';$form.MaximizeBox=$false;$form.MinimizeBox=$false
     $form.BackColor=[System.Drawing.ColorTranslator]::FromHtml('#F4F1E9')
     $form.Font=[System.Drawing.Font]::new('Microsoft YaHei UI',10)
     $heading=[System.Windows.Forms.Label]::new();$heading.Text='先开始 5 分钟就好。';$heading.Location=[System.Drawing.Point]::new(22,22);$heading.Size=[System.Drawing.Size]::new(430,32);$heading.Font=[System.Drawing.Font]::new('Microsoft YaHei UI',15,[System.Drawing.FontStyle]::Bold)
-    $label=[System.Windows.Forms.Label]::new();$label.Text=$body;$label.Location=[System.Drawing.Point]::new(24,70);$label.Size=[System.Drawing.Size]::new(424,70)
-    $go=[System.Windows.Forms.Button]::new();$go.Text='现在开始';$go.Location=[System.Drawing.Point]::new(24,157);$go.Size=[System.Drawing.Size]::new(128,36)
-    $snooze=[System.Windows.Forms.Button]::new();$snooze.Text='15 分钟后';$snooze.Location=[System.Drawing.Point]::new(172,157);$snooze.Size=[System.Drawing.Size]::new(128,36)
-    $skip=[System.Windows.Forms.Button]::new();$skip.Text='今天休息';$skip.Location=[System.Drawing.Point]::new(320,157);$skip.Size=[System.Drawing.Size]::new(128,36)
-    $go.Add_Click({ Send-Action 'start';Open-Study;$script:reminderForm.Close() })
-    $snooze.Add_Click({ Send-Action 'snooze';$timer.Interval=60000;$script:reminderForm.Close() })
+    $label=[System.Windows.Forms.Label]::new();$label.Text=if ($body.Length -gt 130) {$body.Substring(0,130)+'…'} else {$body};$label.Location=[System.Drawing.Point]::new(24,70);$label.Size=[System.Drawing.Size]::new(448,115)
+    $go=[System.Windows.Forms.Button]::new();$go.Text='开始 5 分钟';$go.Location=[System.Drawing.Point]::new(24,205);$go.Size=[System.Drawing.Size]::new(104,36)
+    $longer=[System.Windows.Forms.Button]::new();$longer.Text='学半小时';$longer.Location=[System.Drawing.Point]::new(138,205);$longer.Size=[System.Drawing.Size]::new(104,36)
+    $easy=[System.Windows.Forms.Button]::new();$easy.Text='换个轻松的';$easy.Location=[System.Drawing.Point]::new(252,205);$easy.Size=[System.Drawing.Size]::new(104,36)
+    $skip=[System.Windows.Forms.Button]::new();$skip.Text='今天休息';$skip.Location=[System.Drawing.Point]::new(366,205);$skip.Size=[System.Drawing.Size]::new(104,36)
+    $go.Add_Click({ Open-Study '?study=5';$script:reminderForm.Close() })
+    $longer.Add_Click({ Open-Study '?study=30';$script:reminderForm.Close() })
+    $easy.Add_Click({ Open-Study '?study=5&easy=1';$script:reminderForm.Close() })
     $skip.Add_Click({ Send-Action 'skip';$script:reminderForm.Close() })
-    $form.Controls.AddRange(@($heading,$label,$go,$snooze,$skip));$form.Show()
+    $form.Controls.AddRange(@($heading,$label,$go,$longer,$easy,$skip));$form.Show()
     @{pid=$PID;shown_at=[DateTimeOffset]::Now.ToString('o');state='reminder-shown';app='孙权';icon=$appIconPath} | ConvertTo-Json -Compress | Set-Content -LiteralPath $trayStatus -Encoding UTF8
 }
 $timer=[System.Windows.Forms.Timer]::new();$timer.Interval=45000

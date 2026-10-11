@@ -29,16 +29,17 @@
       <section id="view-today" class="view" aria-labelledby="today-title">
         <div class="eyebrow">从这里接着走</div>
         <h1 id="today-title">不用赶进度，<br>先开始一小步。</h1>
-        <p class="intro">五到十分钟也算学习。今天，只做一件小事。</p>
+        <p class="intro">选一个适合今天的时间，接着上次的一小步。</p>
         <article class="today-task">
           <div class="task-index" aria-hidden="true">01<span>今日小步</span></div>
-          <div class="task-content"><div class="eyebrow">你的下一步</div><h2 id="next-step">先花5分钟，查看一条课程通知。</h2><p id="reminder-body">从一条通知、一个问题，或一页笔记开始。</p><div class="actions"><button class="primary" id="start">现在开始 <span aria-hidden="true">↗</span></button><button class="secondary" id="snooze">15分钟后</button><button class="quiet" id="skip">今天休息</button></div><p id="reminder-status" class="hint" aria-live="polite"></p></div>
+          <div class="task-content"><div class="eyebrow">你的下一步</div><h2 id="next-step">先花5分钟，查看一条课程通知。</h2><p id="reminder-body">从一条通知、一个问题，或一页笔记开始。</p><fieldset class="duration"><legend>这次想留多少时间？</legend><label><input type="radio" name="minutes" value="5" checked> 5分钟小步</label><label><input type="radio" name="minutes" value="30"> 30分钟深入</label></fieldset><p id="plan-context" class="hint"></p><div class="actions"><button class="primary" id="start" disabled>现在开始 <span aria-hidden="true">↗</span></button><button class="secondary" id="easy">换个轻松的</button><button class="secondary" id="plan-retry" hidden>重新读取小步</button><button class="secondary" id="snooze">15分钟后</button><button class="quiet" id="skip">今天休息</button></div><p id="reminder-status" class="hint" aria-live="polite"></p></div>
         </article>
         <div class="today-bottom"><article><div class="eyebrow">已经留下的线索</div><h2>把上次的想法接起来</h2><p id="summary">还没有学习记录。先问一个课程问题，或在记忆里记下你目前学到哪儿。</p><button class="text-button" data-view="memory">看看我的记忆 <span aria-hidden="true">→</span></button></article><article class="library-card"><div class="eyebrow">身边的资料</div><h2><span id="document-count">—</span> <small>份课程资料</small></h2><p>先从本地资料找依据。回答里会附上可以查看的出处。</p><button class="text-button" data-view="sources">浏览课程资料 <span aria-hidden="true">→</span></button></article></div>
       </section>
       <section id="view-learn" class="view" aria-labelledby="learn-title" hidden>
         <div class="section-heading"><div><div class="eyebrow">一次解决一个问题</div><h1 id="learn-title">一起弄明白。</h1></div><button id="new-chat" class="secondary">新对话</button></div>
         <p class="intro">用你自己的话提问，资料里的原句也可以。</p>
+        <article id="study-panel" class="panel study-panel" hidden aria-label="这次学习小步"></article>
         <div class="chat" id="chat" role="log" aria-label="学习对话" aria-live="polite"><div class="empty-state" id="chat-empty"><span aria-hidden="true">↗</span><h2>从一个具体问题开始</h2><p>例如：“这份课程通知里，我这周要做什么？”<br>回答是学习参考，实际进度由你在记忆中记录。</p></div></div>
         <form id="chat-form" class="composer"><label for="question" class="sr-only">你的课程问题</label><textarea id="question" rows="3" maxlength="12000" placeholder="有什么想弄明白的？" required></textarea><div class="composer-options"><label class="checkbox"><input id="web" type="checkbox">联网查资料（仅发送本次问题）</label><button class="primary" id="send" type="submit">发送 <span aria-hidden="true">↑</span></button></div><label id="url-row" class="url-row" hidden>指定网页（可选）<input id="url" type="url" placeholder="https://…" aria-label="指定联网资料的网址"></label><p id="chat-status" class="hint" role="status" aria-live="polite">按发送开始提问；Ctrl / ⌘ + Enter 也可以。</p></form>
       </section>
